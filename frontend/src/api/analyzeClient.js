@@ -75,7 +75,7 @@ async function createPreview(sessionId) {
     body: JSON.stringify({
       clip_duration: 45,
       mashup_mode: "auto",
-      use_stem_separation: false,
+      use_stem_separation: true,
     }),
   }, "Preview");
 

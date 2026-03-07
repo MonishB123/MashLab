@@ -23,6 +23,12 @@ export default function ResultCard({ result, song1Name, song2Name }) {
 
       <CompatibilityMeter score={result.score} />
 
+      {result.preview?.summary && (
+        <p className="font-mono text-xs text-muted-foreground bg-muted p-2 rounded border border-dashed">
+          {result.preview.summary}
+        </p>
+      )}
+
       <div className="h-px bg-foreground" />
 
       {isCompatible ? (
