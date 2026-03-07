@@ -1,23 +1,49 @@
-This project contains everything you need to run your app locally.
+# MashLab Project Layout
 
-**Edit the code in your local development environment**
+This repo is now split into:
 
-Any change pushed to the repo will also be reflected in the Base44 Builder.
+- `frontend/`: Vite + React UI
+- `backend/`: Local API server for song analysis
 
-**Prerequisites:** 
+## Install
 
-1. Clone the repository using the project's Git URL 
-2. Navigate to the project directory
-3. Install dependencies: `npm install`
-4. Create an `.env.local` file and set the right environment variables
+From the repo root:
 
+```powershell
+npm install --prefix frontend
+npm install --prefix backend
 ```
+
+## Environment
+
+Copy `frontend/.env.example` to `frontend/.env.local` and set values:
+
+```env
+VITE_API_BASE_URL=http://localhost:8787
 VITE_BASE44_APP_ID=your_app_id
 VITE_BASE44_APP_BASE_URL=your_backend_url
-
-e.g.
-VITE_BASE44_APP_ID=cbef744a8545c389ef439ea6
-VITE_BASE44_APP_BASE_URL=https://my-to-do-list-81bfaad7.base44.app
 ```
 
-Run the app: `npm run dev`
+`VITE_BASE44_*` values are optional for the current mocked base44 client, but safe to keep.
+
+## Run Locally
+
+Terminal 1:
+
+```powershell
+npm run dev:backend
+```
+
+Terminal 2:
+
+```powershell
+npm run dev:frontend
+```
+
+Frontend defaults to `http://localhost:5173` and backend defaults to `http://localhost:8787`.
+
+## Health Check
+
+```powershell
+Invoke-RestMethod http://localhost:8787/api/health
+```
