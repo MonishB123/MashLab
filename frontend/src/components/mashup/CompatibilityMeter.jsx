@@ -40,25 +40,25 @@ export default function CompatibilityMeter({ score }) {
   return (
     <div className="w-full animate-fade-up">
       {/* Score number */}
-      <div className="flex items-end gap-4 mb-4">
-        <span className="font-display leading-none" style={{ fontSize: "clamp(4rem, 10vw, 7rem)", color }}>
+      <div className="flex items-end gap-6 mb-6">
+        <span className="font-display leading-none" style={{ fontSize: "clamp(5rem, 12vw, 9rem)", color }}>
           {displayScore}
         </span>
-        <div className="pb-3">
-          <span className="font-display text-2xl text-muted-foreground">/100</span>
+        <div className="pb-4">
+          <span className="font-display text-4xl text-muted-foreground">/100</span>
         </div>
-        <div className="pb-3 ml-auto text-right">
-          <p className="font-display text-3xl text-foreground">{getScoreLabel(score)}</p>
-          <p className="font-mono text-xs text-muted-foreground mt-1 max-w-[200px]">{getScoreSubtext(score)}</p>
+        <div className="pb-4 ml-auto text-right">
+          <p className="font-display text-5xl text-foreground">{getScoreLabel(score)}</p>
+          <p className="font-mono text-base text-muted-foreground mt-2 max-w-[280px] font-bold">{getScoreSubtext(score)}</p>
         </div>
       </div>
 
       {/* Segmented bar */}
-      <div className="flex gap-1">
+      <div className="flex gap-2">
         {[...Array(TOTAL)].map((_, i) => (
           <div
             key={i}
-            className="flex-1 h-5 border border-foreground transition-all duration-75"
+            className="flex-1 h-10 border-3 border-foreground transition-all duration-75"
             style={{
               background: i < filled ? color : "transparent",
               transitionDelay: `${i * 30}ms`,
@@ -67,10 +67,10 @@ export default function CompatibilityMeter({ score }) {
         ))}
       </div>
 
-      <div className="flex justify-between mt-1">
-        <span className="font-mono text-xs text-muted-foreground">0</span>
-        <span className="font-mono text-xs text-muted-foreground">COMPATIBILITY</span>
-        <span className="font-mono text-xs text-muted-foreground">100</span>
+      <div className="flex justify-between mt-3 font-bold">
+        <span className="font-mono text-base text-muted-foreground">0</span>
+        <span className="font-mono text-base text-muted-foreground uppercase tracking-widest">COMPATIBILITY</span>
+        <span className="font-mono text-base text-muted-foreground">100</span>
       </div>
     </div>
   );

@@ -21,7 +21,7 @@ export default function SongUploader({ label, file, onFileChange, disabled, inde
   return (
     <div
       className={cn(
-        "brutal-card p-5 flex flex-col gap-4 cursor-pointer relative min-h-[180px] select-none",
+        "brutal-card p-7 flex flex-col gap-5 cursor-pointer relative min-h-[220px] select-none",
         dragging && "brutal-card-active bg-primary/10",
         disabled && "opacity-40 pointer-events-none"
       )}
@@ -40,30 +40,30 @@ export default function SongUploader({ label, file, onFileChange, disabled, inde
 
       {/* Index badge */}
       <div className="flex items-center justify-between">
-        <span className="font-display text-5xl leading-none text-border select-none">{index}</span>
+        <span className="font-display text-6xl leading-none text-border select-none">{index}</span>
         {file && (
           <button
-            className="w-6 h-6 border-2 border-foreground flex items-center justify-center hover:bg-primary hover:border-primary hover:text-white transition-colors"
+            className="w-8 h-8 border-2 border-foreground flex items-center justify-center hover:bg-primary hover:border-primary hover:text-white transition-colors"
             onClick={(e) => { e.stopPropagation(); onFileChange(null); }}
           >
-            <X className="w-3 h-3" />
+            <X className="w-4 h-4" />
           </button>
         )}
       </div>
 
       <div className="mt-auto">
-        <p className="font-display text-lg text-foreground">{label}</p>
+        <p className="font-display text-3xl text-foreground">{label}</p>
         {file ? (
           <>
-            <div className="h-px bg-primary my-2" />
-            <p className="font-mono text-xs text-foreground truncate">{file.name}</p>
-            <p className="font-mono text-xs text-muted-foreground mt-0.5">{(file.size / 1024 / 1024).toFixed(2)} MB · MP3</p>
+            <div className="h-px bg-primary my-4" />
+            <p className="font-mono text-base text-foreground truncate font-bold">{file.name}</p>
+            <p className="font-mono text-sm text-muted-foreground mt-1.5 font-bold">{(file.size / 1024 / 1024).toFixed(2)} MB · MP3</p>
           </>
         ) : (
           <>
-            <div className="h-px bg-border my-2" />
-            <p className="font-mono text-xs text-muted-foreground">drag & drop or click</p>
-            <p className="font-mono text-xs text-muted-foreground">.mp3 only</p>
+            <div className="h-px bg-border my-4" />
+            <p className="font-mono text-base text-muted-foreground font-bold">drag & drop or click</p>
+            <p className="font-mono text-sm text-muted-foreground mt-1.5 font-bold">.mp3 only</p>
           </>
         )}
       </div>
