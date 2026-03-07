@@ -5,9 +5,9 @@ import ResultCard from "../components/mashup/ResultCard";
 import { analyzeSongs } from "../api/analyzeClient";
 
 const VinylRecord = () => (
-  <div className="relative w-96 h-96 animate-spin-slow rounded-full" style={{ boxShadow: '12px 12px 0px hsl(var(--foreground))' }}>
-    {/* Outer disc */}
-    <div className="absolute inset-0 rounded-full bg-[#111] border-[5px] border-foreground flex items-center justify-center overflow-hidden">
+  <div className="relative w-96 h-96 shrink-0">
+    {/* Outer disc (Spinning) */}
+    <div className="absolute inset-0 rounded-full bg-[#111] border-[5px] border-foreground flex items-center justify-center overflow-hidden animate-spin-slow">
       {/* Grooves / Refraction */}
       <div className="absolute inset-0 rounded-full opacity-30" style={{
         background: 'conic-gradient(from 0deg, transparent 0deg, rgba(255,255,255,0.4) 45deg, transparent 90deg, rgba(255,255,255,0.4) 135deg, transparent 180deg, rgba(255,255,255,0.4) 225deg, transparent 270deg, rgba(255,255,255,0.4) 315deg, transparent 360deg)'
