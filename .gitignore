@@ -28,3 +28,8 @@ dist-ssr
 *.sw?
 
 .env
+
+# Python backend artifacts
+backend/mashup_backend/.sessions/
+backend/**/__pycache__/
+backend/**/*.pyc

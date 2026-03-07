@@ -1,0 +1,228 @@
+"""
+source_separation.py
+
+Separates a track into stems (vocals, drums, bass, other/melody) using
+Facebook's Demucs model. This enables proper mashup combinations like:
+  - Vocals from Song A + Instrumental (drums+bass+other) from Song B
+  - Both instrumentals layered under Song A's vocals
+  - Custom stem blends
+
+Demucs docs: https://github.com/facebookresearch/demucs
+
+Install:
+    pip install demucs
+
+Usage:
+    from source_separation import separate_track, StemBundle, blend_stems
+    stems = separate_track("song.mp3", out_dir="stems/song/")
+    # stems.vocals, stems.drums, stems.bass, stems.other → np.ndarray
+
+    instrumental = blend_stems(stems, include=["drums", "bass", "other"])
+    vocals_only  = blend_stems(stems, include=["vocals"])
+"""
+
+from __future__ import annotations
+
+import os
+import subprocess
+import tempfile
+from dataclasses import dataclass
+from pathlib import Path
+from typing import List, Optional, Tuple
+
+import numpy as np
+import soundfile as sf
+
+
+@dataclass
+class StemBundle:
+    """Holds separated stems for a single track (all same sr)."""
+    vocals: np.ndarray
+    drums: np.ndarray
+    bass: np.ndarray
+    other: np.ndarray
+    sr: int
+    source_path: str
+
+    def get(self, name: str) -> np.ndarray:
+        return getattr(self, name)
+
+
+def _run_demucs(
+    audio_path: str,
+    out_dir: str,
+    model: str = "htdemucs",
+    device: str = "cpu",
+) -> Path:
+    """
+    Run Demucs CLI to separate stems.
+    Returns the directory containing the separated WAV files.
+    """
+    os.makedirs(out_dir, exist_ok=True)
+    cmd = [
+        "python", "-m", "demucs",
+        "--two-stems", "vocals",   # fast 2-stem mode: vocals + no_vocals
+        "-n", model,
+        "-d", device,
+        "--out", out_dir,
+        audio_path,
+    ]
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    if result.returncode != 0:
+        raise RuntimeError(f"Demucs failed:\n{result.stderr}")
+
+    # Demucs outputs to: out_dir/model/track_name/
+    track_name = Path(audio_path).stem
+    stem_dir = Path(out_dir) / model / track_name
+    return stem_dir
+
+
+def _run_demucs_4stem(
+    audio_path: str,
+    out_dir: str,
+    model: str = "htdemucs",
+    device: str = "cpu",
+) -> Path:
+    """
+    Run Demucs in full 4-stem mode: vocals, drums, bass, other.
+    Slower but enables more creative mashup blends.
+    """
+    os.makedirs(out_dir, exist_ok=True)
+    cmd = [
+        "python", "-m", "demucs",
+        "-n", model,
+        "-d", device,
+        "--out", out_dir,
+        audio_path,
+    ]
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    if result.returncode != 0:
+        raise RuntimeError(f"Demucs 4-stem failed:\n{result.stderr}")
+
+    track_name = Path(audio_path).stem
+    return Path(out_dir) / model / track_name
+
+
+def _load_stem(stem_path: Path, name: str, sr: int) -> np.ndarray:
+    """Load a stem WAV file; return mono float32 array."""
+    import librosa
+    wav_file = stem_path / f"{name}.wav"
+    if not wav_file.exists():
+        # Return silence if stem missing
+        return np.zeros(sr, dtype=np.float32)
+    y, _ = librosa.load(str(wav_file), sr=sr, mono=True)
+    return y
+
+
+def separate_track(
+    audio_path: str,
+    out_dir: Optional[str] = None,
+    model: str = "htdemucs",
+    device: str = "cpu",
+    sr: int = 44100,
+    four_stem: bool = True,
+) -> StemBundle:
+    """
+    Separate `audio_path` into stems using Demucs.
+
+    Args:
+        audio_path:  Input MP3/WAV path.
+        out_dir:     Where to write separated WAVs. Uses a temp dir if None.
+        model:       Demucs model name. htdemucs is recommended.
+        device:      'cpu' or 'cuda'.
+        sr:          Output sample rate.
+        four_stem:   If True, separate into vocals/drums/bass/other.
+                     If False, use fast 2-stem (vocals / no_vocals).
+
+    Returns:
+        StemBundle with numpy arrays for each stem.
+    """
+    cleanup = False
+    if out_dir is None:
+        out_dir = tempfile.mkdtemp(prefix="mashup_stems_")
+        cleanup = True
+
+    try:
+        if four_stem:
+            stem_dir = _run_demucs_4stem(audio_path, out_dir, model, device)
+        else:
+            stem_dir = _run_demucs(audio_path, out_dir, model, device)
+
+        vocals = _load_stem(stem_dir, "vocals", sr)
+        drums  = _load_stem(stem_dir, "drums", sr)
+        bass   = _load_stem(stem_dir, "bass", sr)
+        other  = _load_stem(stem_dir, "other", sr)
+
+        # In 2-stem mode, no_vocals is stored as "no_vocals"
+        if not four_stem:
+            no_vocals_file = stem_dir / "no_vocals.wav"
+            if no_vocals_file.exists():
+                import librosa
+                nv, _ = librosa.load(str(no_vocals_file), sr=sr, mono=True)
+                drums = nv
+                bass = np.zeros_like(nv)
+                other = np.zeros_like(nv)
+
+        return StemBundle(
+            vocals=vocals,
+            drums=drums,
+            bass=bass,
+            other=other,
+            sr=sr,
+            source_path=audio_path,
+        )
+    except Exception as e:
+        raise RuntimeError(f"Stem separation failed for {audio_path}: {e}") from e
+
+
+def blend_stems(
+    bundle: StemBundle,
+    include: List[str],
+    weights: Optional[dict] = None,
+) -> Tuple[np.ndarray, int]:
+    """
+    Mix selected stems from a StemBundle into one audio array.
+
+    Args:
+        bundle:   StemBundle from separate_track().
+        include:  Which stems to include: any of ["vocals","drums","bass","other"].
+        weights:  Optional per-stem gain multipliers, e.g. {"vocals": 1.2}.
+
+    Returns:
+        (mixed_audio, sr)
+    """
+    arrays = []
+    for name in include:
+        stem = bundle.get(name).copy()
+        if weights and name in weights:
+            stem *= weights[name]
+        arrays.append(stem)
+
+    if not arrays:
+        return np.zeros(bundle.sr, dtype=np.float32), bundle.sr
+
+    # Pad all to same length
+    max_len = max(len(a) for a in arrays)
+    padded = []
+    for a in arrays:
+        if len(a) < max_len:
+            a = np.concatenate([a, np.zeros(max_len - len(a), dtype=np.float32)])
+        padded.append(a)
+
+    mixed = np.sum(padded, axis=0)
+    # Normalize
+    peak = np.max(np.abs(mixed))
+    if peak > 1e-9:
+        mixed = mixed * (0.95 / peak)
+
+    return mixed.astype(np.float32), bundle.sr
+
+
+def is_demucs_available() -> bool:
+    """Check whether demucs is installed and runnable."""
+    result = subprocess.run(
+        ["python", "-m", "demucs", "--help"],
+        capture_output=True,
+        text=True,
+    )
+    return result.returncode == 0

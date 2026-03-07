@@ -6,8 +6,6 @@ import { analyzeSongs } from "../api/analyzeClient";
 
 const MARQUEE_TEXT = "MASHLAB - AUDIO COMPATIBILITY - DROP YOUR TRACKS - ";
 
-const fileNameWithoutExt = (file) => file?.name?.replace(/\.[^/.]+$/, "");
-
 export default function Home() {
   const [song1, setSong1] = useState(null);
   const [song2, setSong2] = useState(null);
@@ -34,13 +32,7 @@ export default function Home() {
 
     try {
       const backendResult = await analyzeSongs(song1, song2);
-      const previewFile = backendResult.preview_source === "song2" ? song2 : song1;
-
-      setResult({
-        ...backendResult,
-        preview_url: previewFile ? URL.createObjectURL(previewFile) : null,
-        preview_song_name: backendResult.preview_song_name || fileNameWithoutExt(previewFile),
-      });
+      setResult(backendResult);
     } catch (error) {
       console.error(error);
       setErrorMessage(error.message || "Unable to analyze tracks right now.");

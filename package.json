@@ -3,6 +3,8 @@
   "private": true,
   "version": "1.0.0",
   "scripts": {
+    "setup:frontend": "npm --prefix frontend install",
+    "setup:backend": "npm --prefix backend run install:deps",
     "dev:frontend": "npm --prefix frontend run dev",
     "dev:backend": "npm --prefix backend run dev",
     "build:frontend": "npm --prefix frontend run build",

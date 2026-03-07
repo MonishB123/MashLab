@@ -1,49 +1,52 @@
-# MashLab Project Layout
+# MashLab
 
-This repo is now split into:
+Repo layout:
 
-- `frontend/`: Vite + React UI
-- `backend/`: Local API server for song analysis
+- `frontend/`: React + Vite UI
+- `backend/`: Python FastAPI mashup backend (from `mashup_backend_v3`)
 
-## Install
+## Prerequisites
 
-From the repo root:
+- Node.js (for frontend)
+- Python 3.10+ (backend tested with Python 3.14 without Demucs)
+- FFmpeg on PATH (recommended for MP3 export)
+
+## Setup
+
+From repo root:
 
 ```powershell
-npm install --prefix frontend
-npm install --prefix backend
+npm.cmd run setup:frontend
+npm.cmd run setup:backend
 ```
 
-## Environment
-
-Copy `frontend/.env.example` to `frontend/.env.local` and set values:
+Create `frontend/.env.local` (copy from `frontend/.env.example`):
 
 ```env
 VITE_API_BASE_URL=http://localhost:8787
-VITE_BASE44_APP_ID=your_app_id
-VITE_BASE44_APP_BASE_URL=your_backend_url
 ```
 
-`VITE_BASE44_*` values are optional for the current mocked base44 client, but safe to keep.
-
-## Run Locally
+## Run
 
 Terminal 1:
 
 ```powershell
-npm run dev:backend
+npm.cmd run dev:backend
 ```
 
 Terminal 2:
 
 ```powershell
-npm run dev:frontend
+npm.cmd run dev:frontend
 ```
 
-Frontend defaults to `http://localhost:5173` and backend defaults to `http://localhost:8787`.
-
-## Health Check
+## API health
 
 ```powershell
 Invoke-RestMethod http://localhost:8787/api/health
 ```
+
+## Notes
+
+- No external API keys are required for this backend.
+- Stem separation via Demucs is optional and currently excluded from default install because dependency support is limited on Python 3.14.

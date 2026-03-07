@@ -2,9 +2,10 @@
   "name": "mashlab-backend",
   "private": true,
   "version": "1.0.0",
-  "type": "module",
   "scripts": {
-    "dev": "node server.js",
-    "start": "node server.js"
+    "dev": "python -m uvicorn api:app --host 0.0.0.0 --port 8787 --app-dir ./mashup_backend",
+    "dev:reload": "python -m uvicorn api:app --reload --host 0.0.0.0 --port 8787 --app-dir ./mashup_backend",
+    "start": "python -m uvicorn api:app --host 0.0.0.0 --port 8787 --app-dir ./mashup_backend",
+    "install:deps": "python -m pip install -r mashup_backend/requirements.txt"
   }
 }
