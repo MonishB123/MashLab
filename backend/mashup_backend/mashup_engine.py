@@ -45,6 +45,7 @@ from audio_render import (
     time_stretch_audio,
     pitch_shift_audio,
     apply_gain_db,
+    high_pass_filter,
     overlay_audio,
     normalize_peak,
     export_wav,
@@ -60,10 +61,9 @@ class MashupConfig:
     track_a: str
     track_b: str
 
-    clip_duration: float = 45.0          # seconds; 30–60 recommended
+    clip_duration: float = 45.0          # seconds; 30–60 recommended      
     sr: int = 44100                      # output sample rate
-    n_segment_candidates: int = 5        # how many candidate segments to evaluate
-
+    n_segment_candidates: int = 10        # how many candidate segments to evaluate
     # Override auto segment detection with manual start times
     start_a: Optional[float] = None
     start_b: Optional[float] = None
@@ -142,20 +142,47 @@ def _beat_align_offset(
 ) -> int:
     """
     Sub-beat alignment: find the sample offset for B that best aligns its
-    beat grid with A's beat grid, searching within ±1 beat of zero offset.
-    Returns offset in samples (positive = shift B forward).
+    rhythmic structure with A using cross-correlation of PERCUSSIVE elements.
     """
-    _, beats_a = librosa.beat.beat_track(y=y_a, sr=sr, hop_length=hop_length)
-    _, beats_b = librosa.beat.beat_track(y=y_b, sr=sr, hop_length=hop_length)
+    # 1. Extract percussive components (drums) for MUCH cleaner correlation
+    # If a track has no drums, it falls back to the original signal.
+    _, perc_a = librosa.effects.hpss(y_a)
+    _, perc_b = librosa.effects.hpss(y_b)
 
-    if len(beats_a) == 0 or len(beats_b) == 0:
+    # 2. Compute onset strength envelopes of the percussive tracks
+    onset_a = librosa.onset.onset_strength(y=perc_a, sr=sr, hop_length=hop_length)
+    onset_b = librosa.onset.onset_strength(y=perc_b, sr=sr, hop_length=hop_length)
+
+    # 3. Cross-correlate the envelopes to find the best rhythmic overlap
+    # We only care about shifts within +/- 1 second for fine-tuning
+    max_shift_s = 1.0
+    max_shift_frames = int(max_shift_s * sr / hop_length)
+    
+    # Normalize envelopes to improve correlation
+    onset_a = (onset_a - np.mean(onset_a)) / (np.std(onset_a) + 1e-9)
+    onset_b = (onset_b - np.mean(onset_b)) / (np.std(onset_b) + 1e-9)
+
+    # Compute correlation
+    corr = np.correlate(onset_a, onset_b, mode='full')
+    center = len(onset_b) - 1
+    
+    start = max(0, center - max_shift_frames)
+    end = min(len(corr), center + max_shift_frames + 1)
+    
+    window = corr[start:end]
+    if len(window) == 0:
         return 0
-
-    # Convert first beat frame to samples
-    first_beat_a = int(librosa.frames_to_samples(beats_a[0], hop_length=hop_length))
-    first_beat_b = int(librosa.frames_to_samples(beats_b[0], hop_length=hop_length))
-
-    return first_beat_a - first_beat_b
+        
+    best_idx = np.argmax(window)
+    # Convert back to shift relative to 'center'
+    # NOTE: If shift_frames is positive, B is 'earlier' than A, so we need to delay B.
+    # If shift_frames is negative, B is 'later' than A, so we need to trim B.
+    shift_frames = (start + best_idx) - center
+    
+    # We return the negative so that:
+    # Positive result -> trim B (B was late)
+    # Negative result -> add silence to B (B was early)
+    return int(-shift_frames * hop_length)
 
 
 def _render_full_blend(
@@ -200,32 +227,107 @@ def _render_with_stems(
     from source_separation import separate_track, blend_stems
 
     tmpdir = stems_dir or tempfile.mkdtemp(prefix="mashup_stems_")
+    
+    if stems_dir:
+        os.makedirs(stems_dir, exist_ok=True)
 
-    stems_a = separate_track(path_a, out_dir=os.path.join(tmpdir, "a"), sr=sr)
-    stems_b = separate_track(path_b, out_dir=os.path.join(tmpdir, "b"), sr=sr)
+    # PRE-CLIP the audio before Demucs so it only takes seconds instead of minutes
+    y_a, sr_a = load_audio(path_a, sr=sr)
+    y_b, sr_b = load_audio(path_b, sr=sr)
+    
+    clip_a_raw = trim_audio(y_a, sr, start_a, clip_duration)
+    clip_b_raw = trim_audio(y_b, sr, start_b, clip_duration)
 
-    if mode == "vocals_a_inst_b":
+    clip_a_path = os.path.join(tmpdir, "clip_a.wav")
+    clip_b_path = os.path.join(tmpdir, "clip_b.wav")
+    export_wav(clip_a_raw, sr, clip_a_path)
+    export_wav(clip_b_raw, sr, clip_b_path)
+
+    # NEW: Find alignment offset using the TEMPO-SYNCED raw segments.
+    # We must stretch Track B raw before comparing it to Track A.
+    clip_b_raw_stretched = time_stretch_audio(clip_b_raw, comp.stretch_factor_b)
+    alignment_offset = _beat_align_offset(clip_a_raw, clip_b_raw_stretched, sr)
+
+    stems_a = separate_track(clip_a_path, out_dir=os.path.join(tmpdir, "a"), sr=sr, four_stem=True)
+    stems_b = separate_track(clip_b_path, out_dir=os.path.join(tmpdir, "b"), sr=sr, four_stem=True)
+
+    # Save all 4 stems to the session's stems_dir for user inspection
+    if stems_dir:
+        os.makedirs(stems_dir, exist_ok=True)
+        # Mix the instrumental components for both tracks
+        from source_separation import blend_stems
+        inst_a, _ = blend_stems(stems_a, ["drums", "bass", "other"])
+        inst_b, _ = blend_stems(stems_b, ["drums", "bass", "other"])
+        
+        export_wav(stems_a.get("vocals"), sr, os.path.join(stems_dir, "track_a_vocals.wav"))
+        export_wav(inst_a, sr, os.path.join(stems_dir, "track_a_instrumental.wav"))
+        export_wav(stems_b.get("vocals"), sr, os.path.join(stems_dir, "track_b_vocals.wav"))
+        export_wav(inst_b, sr, os.path.join(stems_dir, "track_b_instrumental.wav"))
+        
+        # Also log that we saved them
+        print(f"DEBUG: Saved 4 stems to {stems_dir}")
+
+    # ROUTING LOGIC: Strictly enforce "one track lyrics, OTHER track instrumental"
+    if mode == "vocals_a_inst_b" or mode == "vocals_over_instrumental":
+        print(f"DEBUG: Routing A-Vocals + B-Instrumental")
         layer_a, _ = blend_stems(stems_a, ["vocals"])
-        layer_b, _ = blend_stems(stems_b, ["drums", "bass", "other"])
+        layer_b, _ = blend_stems(stems_b, ["drums", "bass", "other"]) 
+        
+        # High-pass filter the vocals to remove original kick/bass bleed
+        layer_a = high_pass_filter(layer_a, sr, cutoff=180.0)
+        
+        # Soft Noise Gate
+        gate_threshold = 0.005 
+        layer_a[np.abs(layer_a) < gate_threshold] = 0.0
+        
+        # FIXED GAIN logic for stems: 
+        # Beat (B) should be slightly louder than Vocals (A)
+        layer_a = normalize_peak(layer_a, peak=0.7)
+        layer_b = normalize_peak(layer_b, peak=0.9)
+        gain_db_b = 0.0 # Stems already balanced by normalization above
+
     elif mode == "inst_a_vocals_b":
+        print(f"DEBUG: Routing A-Instrumental + B-Vocals")
         layer_a, _ = blend_stems(stems_a, ["drums", "bass", "other"])
         layer_b, _ = blend_stems(stems_b, ["vocals"])
+        
+        layer_b = high_pass_filter(layer_b, sr, cutoff=180.0)
+        
+        gate_threshold = 0.005
+        layer_b[np.abs(layer_b) < gate_threshold] = 0.0
+
+        # FIXED GAIN logic for stems: Beat (A) vs Vocals (B)
+        layer_a = normalize_peak(layer_a, peak=0.9)
+        layer_b = normalize_peak(layer_b, peak=0.7)
+        gain_db_b = 0.0
+
     else:
-        # acapella_over_beat: A vocals over full B
+        # Fallback/Acapella mode: A-Vocals + B-Mixed (everything)
+        print(f"DEBUG: Routing A-Vocals + B-Mixed (Acapella mode)")
         layer_a, _ = blend_stems(stems_a, ["vocals"])
         layer_b, _ = blend_stems(stems_b, ["vocals", "drums", "bass", "other"])
+        
+        layer_a = high_pass_filter(layer_a, sr, cutoff=180.0)
+        
+        layer_a = normalize_peak(layer_a, peak=0.7)
+        layer_b = normalize_peak(layer_b, peak=0.8)
+        gain_db_b = 0.0
 
-    # Clip to desired window
-    def clip(y):
-        return trim_audio(y, sr, 0, clip_duration)
-
-    clip_a = clip(layer_a)
-    clip_b = clip(layer_b)
+    clip_a = layer_a
+    clip_b = layer_b
 
     clip_b = time_stretch_audio(clip_b, comp.stretch_factor_b)
     clip_b = pitch_shift_audio(clip_b, sr, comp.pitch_shift_b)
     clip_a = apply_gain_db(clip_a, config.gain_db_a)
     clip_b = apply_gain_db(clip_b, gain_db_b)
+
+    # Use the pre-calculated offset
+    offset = alignment_offset
+    if offset > 0 and offset < len(clip_b):
+        clip_b = clip_b[offset:]
+    elif offset < 0:
+        silence = np.zeros(-offset, dtype=np.float32)
+        clip_b = np.concatenate([silence, clip_b])
 
     return overlay_audio(clip_a, clip_b)
 
@@ -288,15 +390,19 @@ class MashupEngine:
             mode = comp.mashup_type
             # If stem separation off, fall back to full_blend
             if not config.use_stem_separation and mode in (
-                "vocals_a_inst_b", "inst_a_vocals_b", "acapella_over_beat"
+                "vocals_a_inst_b", "inst_a_vocals_b", "acapella_over_beat", "vocals_over_instrumental"
             ):
                 mode = "full_blend"
+                
+            # If stem separation ON, but mode is full_blend, force separation mode
+            if config.use_stem_separation and mode == "full_blend":
+                mode = "vocals_a_inst_b"
 
         gain_db_b = config.gain_db_b if config.gain_db_b is not None else comp.gain_db_b
 
         # ── Step 5: Render ───────────────────────────────────────────────────
         if config.use_stem_separation and mode in (
-            "vocals_a_inst_b", "inst_a_vocals_b", "acapella_over_beat"
+            "vocals_a_inst_b", "inst_a_vocals_b", "acapella_over_beat", "vocals_over_instrumental"
         ):
             mixed = _render_with_stems(
                 config.track_a, config.track_b,
@@ -343,6 +449,7 @@ class MashupEngine:
         # ── Step 8: Build result ─────────────────────────────────────────────
         summary_lines = [
             comp.summary,
+            f"Energy Match: {((seg_score_a + seg_score_b)/2 * 100):.0f}% intensity.",
             f"Clip: Track A starts at {start_a:.1f}s, Track B at {start_b:.1f}s.",
             f"Duration: {config.clip_duration:.0f}s | Mode: {mode.replace('_',' ').title()}.",
         ]

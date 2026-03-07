@@ -27,8 +27,15 @@ from __future__ import annotations
 import os
 import shutil
 import uuid
+import logging
 from pathlib import Path
 from typing import Any, Dict, Optional
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s"
+)
+logger = logging.getLogger(__name__)
 
 from fastapi import FastAPI, File, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
@@ -62,6 +69,7 @@ SESSIONS_DIR.mkdir(parents=True, exist_ok=True)
 
 @app.exception_handler(Exception)
 async def unhandled_exception_handler(_: Request, exc: Exception):
+    logger.exception("Unhandled API exception:")
     # Keep backend errors visible to frontend during development.
     return JSONResponse(status_code=500, content={"detail": str(exc)})
 
@@ -78,6 +86,10 @@ class PreviewRequest(BaseModel):
     use_stem_separation: bool = False
     gain_db_a: float = -1.0
     gain_db_b: Optional[float] = None
+
+class FeedbackRequest(BaseModel):
+    rating: int
+    comments: Optional[str] = None
 
 
 # ---------------------------------------------------------------------------
@@ -167,13 +179,17 @@ async def analyze_session(session_id: str) -> Dict[str, Any]:
     path_a = meta["track_a"]
     path_b = meta["track_b"]
 
-    feats_a = analyze_mp3(path_a)
-    feats_b = analyze_mp3(path_b)
-    comp = compare_tracks(feats_a, feats_b)
+    try:
+        feats_a = analyze_mp3(path_a)
+        feats_b = analyze_mp3(path_b)
+        comp = compare_tracks(feats_a, feats_b)
 
-    # Find top 3 candidate start times for each track
-    cands_a = find_best_segments(path_a, clip_duration=45.0, n_candidates=3)
-    cands_b = find_best_segments(path_b, clip_duration=45.0, n_candidates=3)
+        # Find top 3 candidate start times for each track
+        cands_a = find_best_segments(path_a, clip_duration=45.0, n_candidates=3)
+        cands_b = find_best_segments(path_b, clip_duration=45.0, n_candidates=3)
+    except Exception as e:
+        logger.exception(f"Error during analysis for session {session_id}")
+        raise HTTPException(status_code=500, detail=f"Analysis failed: {str(e)}")
 
     def score_value(name: str, default: float = 0.0) -> float:
         value = getattr(comp, name, default)
@@ -253,6 +269,8 @@ async def render_preview(
     # MP3 export needs ffmpeg. If not available, we still render WAV successfully.
     mp3_out = str(sdir / "preview.mp3") if shutil.which("ffmpeg") else None
 
+    logger.info(f"Rendering preview for session {session_id}. Mode: {req.mashup_mode}, Stems: {req.use_stem_separation}")
+
     config = MashupConfig(
         track_a=meta["track_a"],
         track_b=meta["track_b"],
@@ -268,8 +286,17 @@ async def render_preview(
         stems_dir=str(sdir / "stems"),
     )
 
+    # CRITICAL: If the user didn't explicitly turn off stems, and it's a lyrical pair, 
+    # we should default to stems to ensure we don't just overlay original tracks.
+    if req.use_stem_separation is None:
+        config.use_stem_separation = True
+
     engine = MashupEngine()
-    result = engine.run(config)
+    try:
+        result = engine.run(config)
+    except Exception as e:
+        logger.exception(f"Error rendering preview for session {session_id}")
+        raise HTTPException(status_code=500, detail=f"Rendering failed: {str(e)}")
 
     if not result.success:
         raise HTTPException(status_code=500, detail=result.error)
@@ -329,6 +356,35 @@ async def delete_session(session_id: str):
     if sdir.exists():
         shutil.rmtree(sdir)
     return {"session_id": session_id, "deleted": True}
+
+
+@app.post("/feedback/{session_id}")
+@app.post("/api/feedback/{session_id}")
+async def submit_feedback(session_id: str, req: FeedbackRequest):
+    """Save user feedback (rating 1-5) for a rendered mashup session."""
+    import json
+    sdir = require_session(session_id)
+    feedback_file = sdir / "feedback.json"
+    
+    data = {
+        "rating": req.rating,
+        "comments": req.comments,
+    }
+    
+    try:
+        feedback_file.write_text(json.dumps(data, indent=2))
+        logger.info(f"Saved feedback for session {session_id}: rating={req.rating}")
+        
+        # Optionally, append to a global CSV for training
+        global_csv = SESSIONS_DIR / "all_feedback.csv"
+        csv_line = f"{session_id},{req.rating},{req.comments or ''}\n"
+        with open(global_csv, "a", encoding="utf-8") as f:
+            f.write(csv_line)
+            
+        return {"session_id": session_id, "message": "Feedback saved successfully"}
+    except Exception as e:
+        logger.exception(f"Failed to save feedback for session {session_id}")
+        raise HTTPException(status_code=500, detail="Failed to save feedback.")
 
 
 @app.get("/health")

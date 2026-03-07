@@ -83,11 +83,12 @@ def score_windows(
         window_onset = onset[i : i + frames_per_clip]
         window_flux = flux[i : i + frames_per_clip]
 
-        # Weighted combination: energy 40%, onset density 35%, flux 25%
+        # Weighted combination: energy 45%, onset density 25%, flux 30%
+        # Flux is weighted higher to find dynamic 'drops'
         s = (
-            0.40 * np.mean(window_energy)
-            + 0.35 * np.mean(window_onset)
-            + 0.25 * np.mean(window_flux)
+            0.45 * np.mean(window_energy)
+            + 0.25 * np.mean(window_onset)
+            + 0.30 * np.mean(window_flux)
         )
         scores[i] = s
 
@@ -100,7 +101,7 @@ def find_best_segments(
     n_candidates: int = 3,
     sr: int = 22050,
     hop_length: int = 512,
-    min_gap_s: float = 15.0,
+    min_gap_s: float = 20.0,
 ) -> List[Tuple[float, float]]:
     """
     Analyze an audio file and return the `n_candidates` best start positions
@@ -160,9 +161,8 @@ def pick_best_aligned_segments(
     sr: int = 22050,
 ) -> Tuple[float, float, float, float]:
     """
-    Find start positions in both tracks that maximize both individual segment
-    quality AND energy similarity between the two clips (so they feel like
-    they're in the same part of the song — e.g., both in a chorus/drop).
+    Find start positions in both tracks that maximize combined energy.
+    We prioritize 'high energy' pairs above all else.
 
     Returns:
         (start_a, score_a, start_b, score_b)
@@ -172,16 +172,14 @@ def pick_best_aligned_segments(
 
     # Pick pair that maximizes combined score
     best_score = -1.0
-    best_a = cands_a[0][0]
-    best_b = cands_b[0][0]
-    best_sa = cands_a[0][1]
-    best_sb = cands_b[0][1]
+    best_a, best_sa = cands_a[0]
+    best_b, best_sb = cands_b[0]
 
     for (ta, sa) in cands_a:
         for (tb, sb) in cands_b:
-            # Reward high combined energy AND similarity between scores
-            energy_sim = 1.0 - abs(sa - sb)
-            combined = 0.45 * sa + 0.45 * sb + 0.10 * energy_sim
+            # We want both to be high energy. 
+            # Simple average works well when the individual scores are already optimized for energy.
+            combined = (sa + sb) / 2.0
             if combined > best_score:
                 best_score = combined
                 best_a, best_sa = ta, sa

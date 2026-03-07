@@ -64,6 +64,7 @@ def _run_demucs(
         "--two-stems", "vocals",   # fast 2-stem mode: vocals + no_vocals
         "-n", model,
         "-d", device,
+        "--clip-mode", "clamp",
         "--out", out_dir,
         audio_path,
     ]
@@ -179,6 +180,7 @@ def blend_stems(
     bundle: StemBundle,
     include: List[str],
     weights: Optional[dict] = None,
+    normalize: bool = False,
 ) -> Tuple[np.ndarray, int]:
     """
     Mix selected stems from a StemBundle into one audio array.
@@ -186,7 +188,8 @@ def blend_stems(
     Args:
         bundle:   StemBundle from separate_track().
         include:  Which stems to include: any of ["vocals","drums","bass","other"].
-        weights:  Optional per-stem gain multipliers, e.g. {"vocals": 1.2}.
+        weights:  Optional per-stem gain multipliers, e.g. {"vocals": 1.2}.  
+        normalize: Whether to normalize the resulting mix to 0.95 peak.
 
     Returns:
         (mixed_audio, sr)
@@ -210,13 +213,13 @@ def blend_stems(
         padded.append(a)
 
     mixed = np.sum(padded, axis=0)
-    # Normalize
-    peak = np.max(np.abs(mixed))
-    if peak > 1e-9:
-        mixed = mixed * (0.95 / peak)
+
+    if normalize:
+        peak = np.max(np.abs(mixed))
+        if peak > 1e-9:
+            mixed = mixed * (0.95 / peak)
 
     return mixed.astype(np.float32), bundle.sr
-
 
 def is_demucs_available() -> bool:
     """Check whether demucs is installed and runnable."""

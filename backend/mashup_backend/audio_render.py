@@ -54,7 +54,17 @@ def normalize_peak(y: np.ndarray, peak: float = 0.98) -> np.ndarray:
     return y * (peak / max_val)
 
 
-def overlay_audio(y_a: np.ndarray, y_b: np.ndarray) -> np.ndarray:
+def high_pass_filter(y: np.ndarray, sr: int, cutoff: float = 200.0) -> np.ndarray:
+    """Removes low-end rumble/drums from isolated vocal stems."""
+    from scipy.signal import butter, lfilter
+    nyq = 0.5 * sr
+    normal_cutoff = cutoff / nyq
+    b, a = butter(1, normal_cutoff, btype='high', analog=False)
+    return lfilter(b, a, y)
+
+
+def overlay_audio(y_a: np.ndarray, y_b: np.ndarray) -> np.ndarray: 
+
     target_len = max(len(y_a), len(y_b))
     y_a = pad_or_trim_to_length(y_a, target_len)
     y_b = pad_or_trim_to_length(y_b, target_len)
