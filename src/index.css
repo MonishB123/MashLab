@@ -1,0 +1,159 @@
+@import url('https://fonts.googleapis.com/css2?family=Bebas+Neue&family=Space+Mono:ital,wght@0,400;0,700;1,400&family=Inter:wght@300;400;500&display=swap');
+
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  :root {
+    --background: 40 20% 96%;
+    --foreground: 0 0% 8%;
+
+    --card: 38 18% 92%;
+    --card-foreground: 0 0% 8%;
+
+    --popover: 38 18% 92%;
+    --popover-foreground: 0 0% 8%;
+
+    --primary: 14 95% 55%;
+    --primary-foreground: 0 0% 100%;
+
+    --secondary: 38 12% 86%;
+    --secondary-foreground: 0 0% 20%;
+
+    --muted: 38 10% 88%;
+    --muted-foreground: 0 0% 40%;
+
+    --accent: 14 95% 55%;
+    --accent-foreground: 0 0% 100%;
+
+    --destructive: 0 72% 50%;
+    --destructive-foreground: 0 0% 100%;
+
+    --border: 38 12% 76%;
+    --input: 38 12% 76%;
+    --ring: 14 95% 55%;
+
+    --radius: 0.25rem;
+
+    --score-high: 142 60% 38%;
+    --score-mid: 38 90% 48%;
+    --score-low: 0 72% 50%;
+  }
+}
+
+@layer base {
+  * {
+    @apply border-border;
+  }
+  body {
+    @apply bg-background text-foreground;
+    font-family: 'Inter', sans-serif;
+  }
+  h1, h2, h3, .font-display {
+    font-family: 'Bebas Neue', sans-serif;
+    letter-spacing: 0.04em;
+  }
+  .font-mono-custom {
+    font-family: 'Space Mono', monospace;
+  }
+}
+
+/* Noise texture overlay */
+body::before {
+  content: '';
+  position: fixed;
+  inset: 0;
+  pointer-events: none;
+  z-index: 9999;
+  opacity: 0.025;
+  background-image: url("data:image/svg+xml,%3Csvg viewBox='0 0 256 256' xmlns='http://www.w3.org/2000/svg'%3E%3Cfilter id='noise'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='4' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23noise)'/%3E%3C/svg%3E");
+  background-repeat: repeat;
+  background-size: 128px;
+}
+
+@keyframes float {
+  0%, 100% { transform: translateY(0px) rotate(0deg); }
+  50% { transform: translateY(-8px) rotate(1deg); }
+}
+
+@keyframes fade-up {
+  from { opacity: 0; transform: translateY(24px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+
+@keyframes spin-slow {
+  from { transform: rotate(0deg); }
+  to { transform: rotate(360deg); }
+}
+
+@keyframes marquee {
+  from { transform: translateX(0); }
+  to { transform: translateX(-50%); }
+}
+
+.animate-fade-up {
+  animation: fade-up 0.6s cubic-bezier(0.16, 1, 0.3, 1) forwards;
+}
+
+.animate-float {
+  animation: float 4s ease-in-out infinite;
+}
+
+.animate-spin-slow {
+  animation: spin-slow 12s linear infinite;
+}
+
+.animate-marquee {
+  animation: marquee 18s linear infinite;
+}
+
+/* Brutalist card */
+.brutal-card {
+  background: hsl(var(--card));
+  border: 2px solid hsl(var(--foreground));
+  box-shadow: 4px 4px 0px hsl(var(--foreground));
+  transition: box-shadow 0.15s ease, transform 0.15s ease;
+}
+
+.brutal-card:hover {
+  box-shadow: 6px 6px 0px hsl(var(--foreground));
+  transform: translate(-1px, -1px);
+}
+
+.brutal-card-active {
+  box-shadow: 2px 2px 0px hsl(var(--foreground));
+  transform: translate(2px, 2px);
+}
+
+.brutal-btn {
+  background: hsl(var(--foreground));
+  color: hsl(var(--background));
+  border: 2px solid hsl(var(--foreground));
+  box-shadow: 4px 4px 0px hsl(var(--primary));
+  transition: box-shadow 0.15s ease, transform 0.15s ease;
+  font-family: 'Space Mono', monospace;
+}
+
+.brutal-btn:hover:not(:disabled) {
+  box-shadow: 6px 6px 0px hsl(var(--primary));
+  transform: translate(-2px, -2px);
+}
+
+.brutal-btn:active:not(:disabled) {
+  box-shadow: 2px 2px 0px hsl(var(--primary));
+  transform: translate(2px, 2px);
+}
+
+.brutal-btn:disabled {
+  opacity: 0.35;
+  cursor: not-allowed;
+}
+
+.accent-line {
+  background: hsl(var(--primary));
+}
+
+.tick-border {
+  border: 2px solid hsl(var(--foreground));
+}
