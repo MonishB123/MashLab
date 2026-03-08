@@ -162,6 +162,34 @@ def find_best_segments(
     return results
 
 
+def find_peak_energy_start(
+    audio_path: str,
+    clip_duration: float = 45.0,
+    sr: int = 22050,
+    hop_length: int = 512,
+) -> Tuple[float, float]:
+    """
+    Find the highest-energy segment in a track — the region most likely to
+    contain a chorus or beat drop.
+
+    Uses the proven `find_best_segments` scoring (energy + onset density +
+    spectral flux) to locate the single best clip-length window across the
+    whole track, then returns its start time.
+
+    Returns:
+        (start_seconds, score)
+    """
+    segments = find_best_segments(
+        audio_path,
+        clip_duration=clip_duration,
+        n_candidates=1,
+        sr=sr,
+        hop_length=hop_length,
+        use_middle_crop=False,  # search the whole track, not just the middle
+    )
+    return segments[0]
+
+
 def pick_best_aligned_segments(
     path_a: str,
     path_b: str,

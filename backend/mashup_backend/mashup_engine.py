@@ -46,7 +46,7 @@ class MashupConfig:
 
     clip_duration: float = 45.0
     sr: int = 44100
-    n_segment_candidates: int = 2
+    n_segment_candidates: int = 5
     start_a: Optional[float] = None
     start_b: Optional[float] = None
 
@@ -203,17 +203,16 @@ def _pick_short_sync_window(
     path_b: str,
     clip_duration: float,
     analysis_sr: int = 12000,
-) -> Tuple[float, float, float, float]:
+) -> Tuple[float, float, float, float, float, float]:
     """
-    Pick short windows where local tempo is close and onset pulses align.
-    Returns: (start_a_s, start_b_s, local_tempo_a, local_tempo_b)
+    Pick short windows where local tempo is close, onset pulses align,
+    AND energy is high (prefer chorus / drop regions over quiet intros).
+
+    Returns: (start_a_s, start_b_s, local_tempo_a, local_tempo_b,
+              energy_score_a, energy_score_b)
     """
     y_a, _ = load_audio(path_a, sr=analysis_sr)
     y_b, _ = load_audio(path_b, sr=analysis_sr)
-
-    scan_limit = int(180.0 * analysis_sr)
-    y_a = y_a[:scan_limit]
-    y_b = y_b[:scan_limit]
 
     hop = 512
     env_a = librosa.onset.onset_strength(y=y_a, sr=analysis_sr, hop_length=hop).astype(np.float32)
@@ -225,12 +224,24 @@ def _pick_short_sync_window(
         librosa.feature.tempo(onset_envelope=env_b, sr=analysis_sr, hop_length=hop, aggregate=None)
     )
 
+    # Compute per-frame RMS energy for energy-aware selection
+    rms_a = librosa.feature.rms(y=y_a, hop_length=hop)[0]
+    rms_b = librosa.feature.rms(y=y_b, hop_length=hop)[0]
+    rms_a = rms_a / (np.max(rms_a) + 1e-9)
+    rms_b = rms_b / (np.max(rms_b) + 1e-9)
+
     frames_clip = max(8, int(clip_duration * analysis_sr / hop))
     step_frames = max(1, int(4.0 * analysis_sr / hop))
-    max_start_a = max(0, len(env_a) - frames_clip)
-    max_start_b = max(0, len(env_b) - frames_clip)
-    starts_a = list(range(0, max_start_a + 1, step_frames)) or [0]
-    starts_b = list(range(0, max_start_b + 1, step_frames)) or [0]
+
+    # Skip first/last 10% of each track to avoid intros/outros
+    total_frames_a = len(env_a)
+    total_frames_b = len(env_b)
+    skip_a = int(total_frames_a * 0.10)
+    skip_b = int(total_frames_b * 0.10)
+    max_start_a = max(0, total_frames_a - frames_clip - skip_a)
+    max_start_b = max(0, total_frames_b - frames_clip - skip_b)
+    starts_a = list(range(skip_a, max_start_a + 1, step_frames)) or [0]
+    starts_b = list(range(skip_b, max_start_b + 1, step_frames)) or [0]
 
     def _local_tempo(curve: np.ndarray, i0: int, i1: int, fallback: float) -> float:
         w = curve[i0:i1]
@@ -239,27 +250,56 @@ def _pick_short_sync_window(
             return fallback
         return float(np.median(w))
 
+    def _window_energy(rms: np.ndarray, i0: int, i1: int) -> float:
+        w = rms[i0:min(i1, len(rms))]
+        return float(np.mean(w)) if len(w) > 0 else 0.0
+
     global_tempo_a = float(np.nanmedian(tempo_curve_a)) if len(tempo_curve_a) else 120.0
     global_tempo_b = float(np.nanmedian(tempo_curve_b)) if len(tempo_curve_b) else 120.0
     tempos_a = [_local_tempo(tempo_curve_a, s, s + frames_clip, global_tempo_a) for s in starts_a]
     tempos_b = [_local_tempo(tempo_curve_b, s, s + frames_clip, global_tempo_b) for s in starts_b]
+    energies_a = [_window_energy(rms_a, s, s + frames_clip) for s in starts_a]
+    energies_b = [_window_energy(rms_b, s, s + frames_clip) for s in starts_b]
+
+    # Pre-filter: only keep windows with energy above 50% of max for that track.
+    # This eliminates quiet intros/verses from consideration entirely.
+    max_ea = max(energies_a) if energies_a else 1.0
+    max_eb = max(energies_b) if energies_b else 1.0
+    energy_threshold = 0.50
+    valid_a = [i for i, e in enumerate(energies_a) if e >= energy_threshold * max_ea]
+    valid_b = [i for i, e in enumerate(energies_b) if e >= energy_threshold * max_eb]
+    # Fall back to all windows if filtering is too aggressive
+    if not valid_a:
+        valid_a = list(range(len(starts_a)))
+    if not valid_b:
+        valid_b = list(range(len(starts_b)))
 
     best_score = -1.0
-    best = (0.0, 0.0, global_tempo_a, global_tempo_b)
+    best = (0.0, 0.0, global_tempo_a, global_tempo_b, 0.0, 0.0)
     lag_cap = int(1.5 * analysis_sr / hop)
-    tempos_b_arr = np.array(tempos_b, dtype=np.float32)
+    tempos_b_arr = np.array([tempos_b[j] for j in valid_b], dtype=np.float32)
+    valid_b_arr = np.array(valid_b)
 
-    for i, sa in enumerate(starts_a):
+    for i in valid_a:
+        sa = starts_a[i]
         ta = max(1e-6, float(tempos_a[i]))
+        ea = float(energies_a[i])
         tempo_diffs = np.abs(tempos_b_arr - ta) / ta
-        top_b = np.argsort(tempo_diffs)[: min(4, len(starts_b))]
+        top_b_indices = np.argsort(tempo_diffs)[: min(8, len(valid_b))]
         win_a = env_a[sa : sa + frames_clip]
-        for j in top_b:
-            sb = starts_b[int(j)]
-            tb = max(1e-6, float(tempos_b[int(j)]))
+        for bi in top_b_indices:
+            j = int(valid_b_arr[bi])
+            sb = starts_b[j]
+            tb = max(1e-6, float(tempos_b[j]))
+            eb = float(energies_b[j])
             tempo_score = float(max(0.0, 1.0 - min(1.0, abs(tb - ta) / ta)))
             beat_score = _window_onset_corr(win_a, env_b[sb : sb + frames_clip], lag_cap)
-            combined = 0.7 * tempo_score + 0.3 * beat_score
+            energy_score = (ea + eb) / 2.0
+
+            # Energy-first scoring: energy 50%, tempo 30%, beat sync 20%
+            # Energy is dominant to ensure we land on choruses/drops.
+            # Tempo and beat sync keep things musically compatible.
+            combined = 0.50 * energy_score + 0.30 * tempo_score + 0.20 * beat_score
             if combined > best_score:
                 best_score = combined
                 best = (
@@ -267,6 +307,8 @@ def _pick_short_sync_window(
                     float(sb * hop / analysis_sr),
                     ta,
                     tb,
+                    ea,
+                    eb,
                 )
     return best
 
@@ -389,6 +431,15 @@ def _onset_offset_and_score(
     return offset_samples, float(np.clip(score, 0.0, 1.0))
 
 
+def _find_first_downbeat(y: np.ndarray, sr: int) -> int:
+    """Find the sample position of the first strong beat in the audio."""
+    hop = 512
+    _, beats = librosa.beat.beat_track(y=y, sr=sr, hop_length=hop, units="samples")
+    if len(beats) == 0:
+        return 0
+    return int(beats[0])
+
+
 def _align_vocal_to_master(
     instrumental_master: np.ndarray,
     rhythm_reference: np.ndarray,
@@ -397,6 +448,7 @@ def _align_vocal_to_master(
 ) -> Tuple[np.ndarray, float]:
     """
     Aligns the vocal stem to the instrumental using onset cross-correlation.
+    Falls back to downbeat alignment when cross-correlation confidence is low.
     Returns (aligned_vocal, beat_lock_score).
     """
     beat_offset, beat_sync_score = _onset_offset_and_score(
@@ -405,7 +457,18 @@ def _align_vocal_to_master(
 
     # Clean the vocal stem by removing leading dead air from separator output.
     vocal, vocal_silence_offset = trim_leading_silence(vocal, sr, top_db=35.0)
-    aligned_vocal = shift_audio(vocal, beat_offset - vocal_silence_offset, target_len=len(instrumental_master))
+
+    if beat_sync_score >= MIN_BEAT_SYNC_SCORE:
+        # Good cross-correlation — use the computed offset.
+        net_offset = beat_offset - vocal_silence_offset
+    else:
+        # Poor cross-correlation — align first downbeats instead.
+        # This is more robust for tracks with different beat structures.
+        db_master = _find_first_downbeat(instrumental_master, sr)
+        db_vocal = _find_first_downbeat(vocal, sr)
+        net_offset = db_master - db_vocal
+
+    aligned_vocal = shift_audio(vocal, net_offset, target_len=len(instrumental_master))
     return aligned_vocal.astype(np.float32), float(beat_sync_score)
 
 
@@ -535,15 +598,15 @@ class MashupEngine:
         if config.start_a is not None and config.start_b is not None:
             start_a = float(config.start_a)
             start_b = float(config.start_b)
+            seg_score_a = 1.0
+            seg_score_b = 1.0
         else:
-            start_a, start_b, _, _ = _pick_short_sync_window(
+            start_a, start_b, _, _, seg_score_a, seg_score_b = _pick_short_sync_window(
                 config.track_a,
                 config.track_b,
                 clip_duration=clip_duration,
                 analysis_sr=12000,
             )
-        seg_score_a = 1.0
-        seg_score_b = 1.0
 
         decision = _choose_direction(comp_ab, comp_ba, config.mashup_mode)
         reject_reasons = list(decision.reject_reasons)

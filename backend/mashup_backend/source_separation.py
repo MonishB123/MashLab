@@ -39,6 +39,16 @@ import torch
 _DEMUCS_STACK_OK: Optional[bool] = None
 
 
+def _demucs_env() -> dict:
+    """Return an env dict that ensures ffmpeg is on PATH for Demucs subprocesses."""
+    env = os.environ.copy()
+    # WinGet installs ffmpeg here; the system PATH may not be refreshed yet.
+    extra = os.path.join(os.environ.get("LOCALAPPDATA", ""), "Microsoft", "WinGet", "Links")
+    if os.path.isdir(extra) and extra not in env.get("PATH", ""):
+        env["PATH"] = extra + os.pathsep + env.get("PATH", "")
+    return env
+
+
 @dataclass
 class StemBundle:
     """Holds separated stems for a single track (all same sr)."""
@@ -53,34 +63,74 @@ class StemBundle:
         return getattr(self, name)
 
 
+_demucs_model_cache = {}
+
+
+def _get_demucs_model(model_name: str, device: str):
+    """Load and cache the Demucs model."""
+    key = (model_name, device)
+    if key not in _demucs_model_cache:
+        from demucs.pretrained import get_model
+
+        m = get_model(model_name)
+        m.to(device)
+        _demucs_model_cache[key] = m
+    return _demucs_model_cache[key]
+
+
+def _run_demucs_inprocess(
+    audio_path: str,
+    out_dir: str,
+    model: str = "htdemucs",
+    device: str = "cpu",
+    two_stem: Optional[str] = None,
+) -> Path:
+    """
+    Run Demucs separation in-process using the Python API.
+    Saves stems with soundfile to avoid torchaudio.save / torchcodec issues.
+    """
+    import librosa as _lr
+
+    demucs_model = _get_demucs_model(model, device)
+
+    # Load audio at the model's expected sample rate
+    y, _ = _lr.load(audio_path, sr=demucs_model.samplerate, mono=False)
+    if y.ndim == 1:
+        y = np.stack([y, y])  # mono → stereo
+    # Demucs expects (batch, channels, samples)
+    wav = torch.from_numpy(y).float().unsqueeze(0).to(device)
+
+    from demucs.apply import apply_model
+
+    sources = apply_model(demucs_model, wav, device=device)
+    # sources shape: (batch, n_sources, channels, samples)
+
+    # apply_model may pad the output; trim back to the original length
+    original_len = y.shape[-1]
+    sources = sources[..., :original_len]
+
+    track_name = Path(audio_path).stem
+    stem_dir = Path(out_dir) / model / track_name
+    os.makedirs(stem_dir, exist_ok=True)
+
+    source_names = demucs_model.sources  # e.g. ['drums', 'bass', 'other', 'vocals']
+    for i, name in enumerate(source_names):
+        stem_audio = sources[0, i].cpu().numpy()  # (channels, samples)
+        # Save as mono WAV using soundfile
+        mono = np.mean(stem_audio, axis=0)
+        sf.write(str(stem_dir / f"{name}.wav"), mono, demucs_model.samplerate)
+
+    return stem_dir
+
+
 def _run_demucs(
     audio_path: str,
     out_dir: str,
     model: str = "htdemucs",
     device: str = "cpu",
 ) -> Path:
-    """
-    Run Demucs CLI to separate stems.
-    Returns the directory containing the separated files.
-    """
-    os.makedirs(out_dir, exist_ok=True)
-    cmd = [
-        sys.executable, "-m", "demucs",
-        "--two-stems", "vocals",   # fast 2-stem mode: vocals + no_vocals
-        "-n", model,
-        "-d", device,
-        "--clip-mode", "clamp",
-        "--out", out_dir,
-        audio_path,
-    ]
-    result = subprocess.run(cmd, capture_output=True, text=True)
-    if result.returncode != 0:
-        raise RuntimeError(f"Demucs failed:\n{result.stderr}")
-
-    # Demucs outputs to: out_dir/model/track_name/
-    track_name = Path(audio_path).stem
-    stem_dir = Path(out_dir) / model / track_name
-    return stem_dir
+    """Run Demucs in 2-stem mode (vocals / no_vocals)."""
+    return _run_demucs_inprocess(audio_path, out_dir, model, device, two_stem="vocals")
 
 
 def _run_demucs_4stem(
@@ -89,25 +139,8 @@ def _run_demucs_4stem(
     model: str = "htdemucs",
     device: str = "cpu",
 ) -> Path:
-    """
-    Run Demucs in full 4-stem mode: vocals, drums, bass, other.
-    Slower but enables more creative mashup blends.
-    """
-    os.makedirs(out_dir, exist_ok=True)
-    cmd = [
-        sys.executable, "-m", "demucs",
-        "-n", model,
-        "-d", device,
-        "--clip-mode", "clamp",
-        "--out", out_dir,
-        audio_path,
-    ]
-    result = subprocess.run(cmd, capture_output=True, text=True)
-    if result.returncode != 0:
-        raise RuntimeError(f"Demucs 4-stem failed:\n{result.stderr}")
-
-    track_name = Path(audio_path).stem
-    return Path(out_dir) / model / track_name
+    """Run Demucs in full 4-stem mode: vocals, drums, bass, other."""
+    return _run_demucs_inprocess(audio_path, out_dir, model, device)
 
 
 def _load_stem(stem_path: Path, name: str, sr: int) -> np.ndarray:

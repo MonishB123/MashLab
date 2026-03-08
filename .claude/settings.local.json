@@ -1,0 +1,15 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(cd /c/Users/bvnar/Desktop/MashLab && npm run dev:backend 2>&1)",
+      "Bash(ls:*)",
+      "Bash(which python:*)",
+      "Bash(cd /c/Users/bvnar/Desktop/MashLab/backend && python -m venv .venv 2>&1)",
+      "Bash(cd /c/Users/bvnar/Desktop/MashLab && npm run setup:backend 2>&1)",
+      "Bash(C:/Users/bvnar/Desktop/MashLab/backend/.venv/Scripts/python.exe -c \"import demucs; print\\('demucs OK'\\)\" 2>&1 && C:/Users/bvnar/Desktop/MashLab/backend/.venv/Scripts/python.exe -c \"import torchaudio; print\\('torchaudio OK'\\)\" 2>&1)",
+      "Bash(C:/Users/bvnar/Desktop/MashLab/backend/.venv/Scripts/python.exe:*)",
+      "Bash(where ffmpeg:*)",
+      "Bash(winget install:*)"
+    ]
+  }
+}

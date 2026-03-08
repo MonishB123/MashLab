@@ -3,9 +3,9 @@
   "private": true,
   "version": "1.0.0",
   "scripts": {
-    "dev": ".\\.venv311\\Scripts\\python.exe -m uvicorn api:app --host 0.0.0.0 --port 8787 --app-dir .\\mashup_backend",
-    "dev:reload": ".\\.venv311\\Scripts\\python.exe -m uvicorn api:app --reload --host 0.0.0.0 --port 8787 --app-dir .\\mashup_backend",
-    "start": ".\\.venv311\\Scripts\\python.exe -m uvicorn api:app --host 0.0.0.0 --port 8787 --app-dir .\\mashup_backend",
-    "install:deps": ".\\.venv311\\Scripts\\python.exe -m pip install -r mashup_backend\\requirements.txt"
+    "dev": ".venv\\Scripts\\python.exe -m uvicorn api:app --host 0.0.0.0 --port 8787 --app-dir mashup_backend",
+    "dev:reload": ".venv\\Scripts\\python.exe -m uvicorn api:app --reload --host 0.0.0.0 --port 8787 --app-dir mashup_backend",
+    "start": ".venv\\Scripts\\python.exe -m uvicorn api:app --host 0.0.0.0 --port 8787 --app-dir mashup_backend",
+    "install:deps": ".venv\\Scripts\\python.exe -m pip install -r mashup_backend\\requirements.txt"
   }
 }
