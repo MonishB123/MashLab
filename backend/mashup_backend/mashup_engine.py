@@ -310,6 +310,40 @@ def _pick_short_sync_window(
                     ea,
                     eb,
                 )
+
+    # --- Energy peak centering ---
+    # Shift starts so the RMS energy peak lands ~35-40% into the clip
+    # (i.e. roughly 15-20s into a 45s clip) instead of near the end.
+    target_peak_frac = 0.37  # where we want the peak (37% into clip)
+    late_threshold = 0.60    # consider it "late" if peak is past 60%
+
+    best_start_a_s, best_start_b_s, bta, btb, bea, beb = best
+
+    for track_label, rms_curve, start_s, total_dur_s in [
+        ("a", rms_a, best_start_a_s, len(y_a) / analysis_sr),
+        ("b", rms_b, best_start_b_s, len(y_b) / analysis_sr),
+    ]:
+        start_frame = int(start_s * analysis_sr / hop)
+        end_frame = start_frame + frames_clip
+        rms_window = rms_curve[start_frame : min(end_frame, len(rms_curve))]
+        if len(rms_window) < 4:
+            continue
+        peak_pos = int(np.argmax(rms_window))
+        peak_frac = peak_pos / len(rms_window)
+        if peak_frac > late_threshold:
+            # Peak is in the last portion — shift start forward so peak
+            # lands at target_peak_frac of the window.
+            shift_frames = int((peak_frac - target_peak_frac) * len(rms_window))
+            new_start_frame = start_frame + shift_frames
+            max_start_frame = int(total_dur_s * analysis_sr / hop) - frames_clip
+            new_start_frame = max(0, min(new_start_frame, max(0, max_start_frame)))
+            new_start_s = float(new_start_frame * hop / analysis_sr)
+            if track_label == "a":
+                best_start_a_s = new_start_s
+            else:
+                best_start_b_s = new_start_s
+
+    best = (best_start_a_s, best_start_b_s, bta, btb, bea, beb)
     return best
 
 
@@ -483,7 +517,7 @@ def _render_with_stems(
     sr: int,
     stems_dir: Optional[str],
     config: MashupConfig,
-) -> Tuple[np.ndarray, float]:
+) -> Tuple[np.ndarray, float, np.ndarray, np.ndarray]:
     tmpdir = stems_dir or tempfile.mkdtemp(prefix="mashup_stems_")
     os.makedirs(tmpdir, exist_ok=True)
     if stems_dir:
@@ -524,7 +558,88 @@ def _render_with_stems(
 
     # Match vocal/instrumental loudness (equal dB proxy via RMS) before summing.
     mixed = _mix_equal_db(inst_eq, vocal_eq)
-    return mixed, beat_sync_score
+    return mixed, beat_sync_score, instrumental, aligned_vocal
+
+
+def _trim_to_best_sync(
+    instrumental: np.ndarray,
+    vocal: np.ndarray,
+    mixed: np.ndarray,
+    sr: int,
+    min_duration: float = 20.0,
+    fade_in_s: float = 0.05,
+    fade_out_s: float = 0.20,
+) -> np.ndarray:
+    """
+    Scan the rendered audio for the best-synced sub-region and trim to it.
+
+    Computes onset envelopes for the instrumental and aligned vocal, then
+    slides a window across and picks the contiguous region (>= min_duration)
+    with the highest local onset cross-correlation.  If no region scores
+    well, the full clip is returned unchanged.
+    """
+    total_s = len(mixed) / sr
+    if total_s <= min_duration + 1.0:
+        return mixed  # Already short enough, nothing to trim
+
+    hop = 512
+    env_inst = librosa.onset.onset_strength(y=instrumental, sr=sr, hop_length=hop).astype(np.float32)
+    env_voc = librosa.onset.onset_strength(y=vocal, sr=sr, hop_length=hop).astype(np.float32)
+
+    min_len = max(len(env_inst), len(env_voc))
+    if min_len == 0:
+        return mixed
+
+    # Window size in frames: use min_duration
+    win_frames = int(min_duration * sr / hop)
+    step_frames = max(1, int(1.0 * sr / hop))  # 1-second steps
+    max_lag = int(0.15 * sr / hop)  # 150ms tolerance
+
+    n_frames = min(len(env_inst), len(env_voc))
+    if win_frames >= n_frames:
+        return mixed
+
+    # Score each window position
+    scores = []
+    positions = list(range(0, n_frames - win_frames + 1, step_frames))
+    for pos in positions:
+        chunk_inst = env_inst[pos : pos + win_frames]
+        chunk_voc = env_voc[pos : pos + win_frames]
+        score = _window_onset_corr(chunk_inst, chunk_voc, max_lag)
+        scores.append(score)
+
+    if not scores:
+        return mixed
+
+    # Find the best contiguous region of high-sync windows.
+    # Start from the best single window and expand outward while score stays
+    # above 70 % of the peak.
+    best_idx = int(np.argmax(scores))
+    threshold = 0.70 * scores[best_idx]
+
+    lo = best_idx
+    hi = best_idx
+    while lo > 0 and scores[lo - 1] >= threshold:
+        lo -= 1
+    while hi < len(scores) - 1 and scores[hi + 1] >= threshold:
+        hi += 1
+
+    # Convert frame indices back to sample positions
+    start_sample = positions[lo] * hop
+    end_sample = min(len(mixed), (positions[hi] + win_frames) * hop)
+
+    # Ensure minimum duration
+    region_duration = (end_sample - start_sample) / sr
+    if region_duration < min_duration:
+        return mixed  # Can't find a good region, keep full clip
+
+    # If the trimmed region is nearly the full clip (>90%), skip trimming
+    if region_duration >= total_s * 0.90:
+        return mixed
+
+    trimmed = mixed[start_sample:end_sample].copy()
+    trimmed = _apply_fade(trimmed, sr, fade_in_s, fade_out_s)
+    return trimmed
 
 
 class MashupEngine:
@@ -621,7 +736,7 @@ class MashupEngine:
         if reject_reasons:
             warnings.append("Ignored compatibility checks: " + "; ".join(reject_reasons))
 
-        mixed, beat_sync_score = _render_with_stems(
+        mixed, beat_sync_score, stem_inst, stem_vocal = _render_with_stems(
             config.track_a,
             config.track_b,
             mode=decision.mode,
@@ -631,6 +746,14 @@ class MashupEngine:
             sr=config.sr,
             stems_dir=config.stems_dir,
             config=config,
+        )
+
+        # Trim to the best-synced region (removes misaligned edges).
+        mixed = _trim_to_best_sync(
+            stem_inst, stem_vocal, mixed, config.sr,
+            min_duration=20.0,
+            fade_in_s=config.fade_in_s,
+            fade_out_s=config.fade_out_s,
         )
 
         if beat_sync_score < MIN_BEAT_SYNC_SCORE:
