@@ -44,8 +44,8 @@ class MashupConfig:
     track_a: str
     track_b: str
 
-    clip_duration: float = 22.0
-    sr: int = 22050
+    clip_duration: float = 45.0
+    sr: int = 44100
     n_segment_candidates: int = 2
     start_a: Optional[float] = None
     start_b: Optional[float] = None
@@ -53,8 +53,8 @@ class MashupConfig:
     mashup_mode: str = "auto"  # auto | vocals_a_inst_b | inst_a_vocals_b | full_blend
     use_stem_separation: bool = True
 
-    gain_db_a: float = -7.0         # instrumental master default
-    gain_db_b: Optional[float] = -5.0  # vocal default
+    gain_db_a: float = 0.0          # instrumental master default (increased from -7.0)
+    gain_db_b: Optional[float] = -3.0  # vocal default (increased from -5.0)
 
     fade_in_s: float = 0.05
     fade_out_s: float = 0.20
@@ -166,15 +166,16 @@ def _separate_clips(
     export_wav(clip_a_raw, sr, clip_a_path)
     export_wav(clip_b_raw, sr, clip_b_path)
 
-    # Fast 2-stem mode: vocals + no_vocals.
-    stems_a = separate_track(clip_a_path, out_dir=os.path.join(tmpdir, "a"), sr=sr, four_stem=False)
-    stems_b = separate_track(clip_b_path, out_dir=os.path.join(tmpdir, "b"), sr=sr, four_stem=False)
+    # Use full 4-stem separation for higher quality.
+    stems_a = separate_track(clip_a_path, out_dir=os.path.join(tmpdir, "a"), sr=sr, four_stem=True)
+    stems_b = separate_track(clip_b_path, out_dir=os.path.join(tmpdir, "b"), sr=sr, four_stem=True)
 
     vocals_a = stems_a.get("vocals")
     vocals_b = stems_b.get("vocals")
-    # In 2-stem mode, source_separation stores no_vocals in drums.
-    inst_a, _ = blend_stems(stems_a, ["drums"], normalize=False)
-    inst_b, _ = blend_stems(stems_b, ["drums"], normalize=False)
+
+    # Blend all non-vocal stems for the instrumental.
+    inst_a, _ = blend_stems(stems_a, ["drums", "bass", "other"], normalize=False)
+    inst_b, _ = blend_stems(stems_b, ["drums", "bass", "other"], normalize=False)
     return vocals_a, inst_a, vocals_b, inst_b
 
 
@@ -512,7 +513,7 @@ class MashupEngine:
             )
 
     def _run(self, config: MashupConfig) -> MashupResult:
-        clip_duration = float(np.clip(config.clip_duration, 18.0, 24.0))
+        clip_duration = float(np.clip(config.clip_duration, 15.0, 60.0))
         feats_a = config.track_a_features or analyze_mp3(
             config.track_a,
             target_sr=16000,

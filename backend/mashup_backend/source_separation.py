@@ -34,6 +34,8 @@ from typing import List, Optional, Tuple
 
 import numpy as np
 import soundfile as sf
+import torch
+
 _DEMUCS_STACK_OK: Optional[bool] = None
 
 
@@ -132,6 +134,7 @@ def _fast_fallback_split(audio_path: str, sr: int) -> StemBundle:
         return StemBundle(vocals=z, drums=z, bass=z, other=z, sr=sr, source_path=audio_path)
 
     harmonic, percussive = librosa.effects.hpss(y)
+    # This is a very poor approximation of vocal separation.
     vocals = harmonic.astype(np.float32)
     no_vocals = (0.80 * percussive + 0.20 * (y - vocals)).astype(np.float32)
     bass = np.zeros_like(no_vocals)
@@ -149,7 +152,7 @@ def _fast_fallback_split(audio_path: str, sr: int) -> StemBundle:
 def _demucs_stack_ok() -> bool:
     """
     Fast preflight for environments where Demucs fails at save time
-    because torchaudio/torchcodec runtime libraries are missing.
+    because torchaudio runtime libraries are missing.
     """
     global _DEMUCS_STACK_OK
     if _DEMUCS_STACK_OK is not None:
@@ -157,7 +160,6 @@ def _demucs_stack_ok() -> bool:
     try:
         import demucs  # noqa: F401
         import torchaudio  # noqa: F401
-        import torchcodec  # noqa: F401
         _DEMUCS_STACK_OK = True
     except Exception:
         _DEMUCS_STACK_OK = False
@@ -168,7 +170,7 @@ def separate_track(
     audio_path: str,
     out_dir: Optional[str] = None,
     model: str = "htdemucs",
-    device: str = "cpu",
+    device: Optional[str] = None,
     sr: int = 44100,
     four_stem: bool = True,
     allow_fallback: bool = True,
@@ -180,7 +182,7 @@ def separate_track(
         audio_path:  Input MP3/WAV path.
         out_dir:     Where to write separated WAVs. Uses a temp dir if None.
         model:       Demucs model name. htdemucs is recommended.
-        device:      'cpu' or 'cuda'.
+        device:      'cpu' or 'cuda'. If None, uses cuda if available.
         sr:          Output sample rate.
         four_stem:   If True, separate into vocals/drums/bass/other.
                      If False, use fast 2-stem (vocals / no_vocals).
@@ -189,6 +191,9 @@ def separate_track(
     Returns:
         StemBundle with numpy arrays for each stem.
     """
+    if device is None:
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+
     cleanup = False
     if out_dir is None:
         out_dir = tempfile.mkdtemp(prefix="mashup_stems_")
@@ -196,7 +201,7 @@ def separate_track(
 
     if allow_fallback and not _demucs_stack_ok():
         warnings.warn(
-            "Demucs runtime stack is unavailable (torchaudio/torchcodec issue). "
+            "Demucs runtime stack is unavailable (torchaudio issue). "
             "Using fast fallback split.",
             RuntimeWarning,
         )

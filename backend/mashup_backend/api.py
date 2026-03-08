@@ -50,13 +50,13 @@ async def unhandled_exception_handler(_: Request, exc: Exception):
 
 
 class PreviewRequest(BaseModel):
-    clip_duration: float = 22.0
+    clip_duration: float = 45.0
     start_a: Optional[float] = None
     start_b: Optional[float] = None
     mashup_mode: str = "auto"  # auto | inst_a_vocals_b | vocals_a_inst_b
     use_stem_separation: bool = True
-    gain_db_a: float = -7.0
-    gain_db_b: Optional[float] = -5.0
+    gain_db_a: float = 0.0
+    gain_db_b: Optional[float] = -3.0
 
 
 class FeedbackRequest(BaseModel):
@@ -131,14 +131,14 @@ async def analyze_session(session_id: str) -> Dict[str, Any]:
         feats_a = analyze_mp3(
             path_a,
             target_sr=16000,
-            analysis_window_s=60.0,
+            analysis_window_s=90.0,
             use_middle_window=True,
             fast_mode=True,
         )
         feats_b = analyze_mp3(
             path_b,
             target_sr=16000,
-            analysis_window_s=60.0,
+            analysis_window_s=90.0,
             use_middle_window=True,
             fast_mode=True,
         )
@@ -217,7 +217,7 @@ async def render_preview(session_id: str, req: PreviewRequest = PreviewRequest()
     mp3_out = str(sdir / "preview.mp3") if shutil.which("ffmpeg") else None
 
     forced_mode = req.mashup_mode if req.mashup_mode in {"auto", "inst_a_vocals_b", "vocals_a_inst_b"} else "auto"
-    clip_duration = float(max(18.0, min(24.0, req.clip_duration)))
+    clip_duration = float(max(15.0, min(60.0, req.clip_duration)))
 
     # Reuse cached analysis/candidate artifacts if present.
     feats_a = None
