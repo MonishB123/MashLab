@@ -1,99 +1,72 @@
 """
 mashup_engine.py
 
-High-level orchestrator for the full mashup pipeline:
+Strict mashup engine.
 
-  1. Analyze both tracks (BPM, key, energy, timbre)
-  2. Score compatibility
-  3. Find the best musical segments in each track (chorus / beat drop)
-  4. Optionally separate stems (vocals / instrumental) via Demucs
-  5. Render the mashup clip with beat-matching, pitch correction, gain leveling
-  6. Export WAV (and optionally MP3)
-
-Usage:
-    from mashup_engine import MashupEngine, MashupConfig
-
-    config = MashupConfig(
-        track_a="song_a.mp3",
-        track_b="song_b.mp3",
-        clip_duration=45.0,
-        mashup_mode="auto",   # auto | full_blend | vocals_a_inst_b | inst_a_vocals_b
-        wav_out="mashup.wav",
-        mp3_out="mashup.mp3",
-    )
-    result = MashupEngine().run(config)
-    print(result.summary)
+Goal:
+- Prefer one instrumental as the master timeline.
+- Adjust only the opposite vocal, and only a little.
+- If the pair is not naturally close enough, reject it instead of forcing it.
 """
 
 from __future__ import annotations
 
 import os
 import tempfile
-from dataclasses import dataclass, field
-from typing import Any, Dict, Optional, Tuple
+from dataclasses import dataclass
+from typing import Any, Dict, List, Optional, Tuple
 
-import numpy as np
 import librosa
-import soundfile as sf
+import numpy as np
 
-from analyze_track import analyze_mp3, TrackFeatures, as_json_dict
-from compatibility import compare_tracks, CompatibilityResult
-from segment_finder import pick_best_aligned_segments
+from analyze_track import TrackFeatures, analyze_mp3, as_json_dict
 from audio_render import (
-    load_audio,
-    trim_audio,
-    time_stretch_audio,
-    pitch_shift_audio,
-    apply_gain_db,
-    high_pass_filter,
-    overlay_audio,
-    normalize_peak,
     export_wav,
+    high_pass_filter,
+    load_audio,
+    normalize_peak,
+    pad_or_trim_to_length,
+    shift_audio,
+    trim_audio,
+    trim_leading_silence,
 )
+from compatibility import CompatibilityResult, compare_tracks
 
 
-# ---------------------------------------------------------------------------
-# Config
-# ---------------------------------------------------------------------------
+MIN_BEAT_SYNC_SCORE = 0.45
+MAX_MANUAL_OFFSET_S = 1.50
+ENFORCE_STRICT_REJECTION = False
+ENFORCE_MIN_BEAT_SYNC = False
+
 
 @dataclass
 class MashupConfig:
     track_a: str
     track_b: str
 
-    clip_duration: float = 45.0          # seconds; 30–60 recommended      
-    sr: int = 44100                      # output sample rate
-    n_segment_candidates: int = 10        # how many candidate segments to evaluate
-    # Override auto segment detection with manual start times
+    clip_duration: float = 22.0
+    sr: int = 22050
+    n_segment_candidates: int = 2
     start_a: Optional[float] = None
     start_b: Optional[float] = None
 
-    # Mashup blend mode:
-    #   "auto"               — pick based on compatibility scores
-    #   "full_blend"         — both tracks mixed equally
-    #   "vocals_a_inst_b"    — vocals from A + instrumental from B  (needs Demucs)
-    #   "inst_a_vocals_b"    — instrumental from A + vocals from B  (needs Demucs)
-    #   "acapella_over_beat" — acapella A over full B
-    mashup_mode: str = "auto"
-    use_stem_separation: bool = False     # set True to enable Demucs (slow but better)
+    mashup_mode: str = "auto"  # auto | vocals_a_inst_b | inst_a_vocals_b | full_blend
+    use_stem_separation: bool = True
 
-    # Gain/mix controls
-    gain_db_a: float = -1.0
-    gain_db_b: Optional[float] = None    # None = auto-balance from loudness scores
+    gain_db_a: float = -7.0         # instrumental master default
+    gain_db_b: Optional[float] = -5.0  # vocal default
 
-    # Fade in/out at clip boundaries (seconds)
-    fade_in_s: float = 0.5
-    fade_out_s: float = 1.5
+    fade_in_s: float = 0.05
+    fade_out_s: float = 0.20
 
-    # Output paths
     wav_out: str = "mashup.wav"
     mp3_out: Optional[str] = None
-    stems_dir: Optional[str] = None      # where to cache Demucs output
+    stems_dir: Optional[str] = None
+    track_a_features: Optional[TrackFeatures] = None
+    track_b_features: Optional[TrackFeatures] = None
+    segment_score_a: Optional[float] = None
+    segment_score_b: Optional[float] = None
 
-
-# ---------------------------------------------------------------------------
-# Result
-# ---------------------------------------------------------------------------
 
 @dataclass
 class MashupResult:
@@ -116,237 +89,416 @@ class MashupResult:
     error: Optional[str] = None
 
 
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
+@dataclass
+class RenderDecision:
+    mode: str
+    comp: CompatibilityResult
+    reject_reasons: List[str]
+
+
 
 def _apply_fade(y: np.ndarray, sr: int, fade_in_s: float, fade_out_s: float) -> np.ndarray:
-    """Apply linear fade-in at start and fade-out at end."""
-    y = y.copy()
+    y = y.copy().astype(np.float32)
     fi = int(fade_in_s * sr)
     fo = int(fade_out_s * sr)
-
-    if fi > 0 and fi < len(y):
-        y[:fi] *= np.linspace(0.0, 1.0, fi)
-    if fo > 0 and fo < len(y):
-        y[-fo:] *= np.linspace(1.0, 0.0, fo)
-
+    if fi > 1 and fi < len(y):
+        y[:fi] *= np.linspace(0.0, 1.0, fi, dtype=np.float32)
+    if fo > 1 and fo < len(y):
+        y[-fo:] *= np.linspace(1.0, 0.0, fo, dtype=np.float32)
     return y
 
 
-def _beat_align_offset(
-    y_a: np.ndarray,
-    y_b: np.ndarray,
+
+def _reject_summary(reasons: List[str]) -> str:
+    return "Mashup rejected: " + "; ".join(reasons) + "."
+
+
+
+def _choose_direction(
+    comp_ab: CompatibilityResult,
+    comp_ba: CompatibilityResult,
+    requested_mode: str,
+) -> RenderDecision:
+    if requested_mode == "inst_a_vocals_b":
+        return RenderDecision(
+            mode="inst_a_vocals_b",
+            comp=comp_ab,
+            reject_reasons=list(comp_ab.reject_reasons),
+        )
+
+    if requested_mode == "vocals_a_inst_b":
+        return RenderDecision(
+            mode="vocals_a_inst_b",
+            comp=comp_ba,
+            reject_reasons=list(comp_ba.reject_reasons),
+        )
+
+    # auto: pick the only safe one, or the better one if both are safe.
+    safe_ab = comp_ab.layerable
+    safe_ba = comp_ba.layerable
+
+    if safe_ab and not safe_ba:
+        return RenderDecision("inst_a_vocals_b", comp_ab, [])
+    if safe_ba and not safe_ab:
+        return RenderDecision("vocals_a_inst_b", comp_ba, [])
+    if safe_ab and safe_ba:
+        if comp_ab.compatibility_score >= comp_ba.compatibility_score:
+            return RenderDecision("inst_a_vocals_b", comp_ab, [])
+        return RenderDecision("vocals_a_inst_b", comp_ba, [])
+
+    # Neither is safe. Return the better one, but keep its reasons.
+    if comp_ab.compatibility_score >= comp_ba.compatibility_score:
+        return RenderDecision("inst_a_vocals_b", comp_ab, list(comp_ab.reject_reasons))
+    return RenderDecision("vocals_a_inst_b", comp_ba, list(comp_ba.reject_reasons))
+
+
+
+def _separate_clips(
+    clip_a_raw: np.ndarray,
+    clip_b_raw: np.ndarray,
     sr: int,
-    hop_length: int = 512,
-) -> int:
-    """
-    Sub-beat alignment: find the sample offset for B that best aligns its
-    rhythmic structure with A using cross-correlation of PERCUSSIVE elements.
-    """
-    # 1. Extract percussive components (drums) for MUCH cleaner correlation
-    # If a track has no drums, it falls back to the original signal.
-    _, perc_a = librosa.effects.hpss(y_a)
-    _, perc_b = librosa.effects.hpss(y_b)
-
-    # 2. Compute onset strength envelopes of the percussive tracks
-    onset_a = librosa.onset.onset_strength(y=perc_a, sr=sr, hop_length=hop_length)
-    onset_b = librosa.onset.onset_strength(y=perc_b, sr=sr, hop_length=hop_length)
-
-    # 3. Cross-correlate the envelopes to find the best rhythmic overlap
-    # We only care about shifts within +/- 1 second for fine-tuning
-    max_shift_s = 1.0
-    max_shift_frames = int(max_shift_s * sr / hop_length)
-    
-    # Normalize envelopes to improve correlation
-    onset_a = (onset_a - np.mean(onset_a)) / (np.std(onset_a) + 1e-9)
-    onset_b = (onset_b - np.mean(onset_b)) / (np.std(onset_b) + 1e-9)
-
-    # Compute correlation
-    corr = np.correlate(onset_a, onset_b, mode='full')
-    center = len(onset_b) - 1
-    
-    start = max(0, center - max_shift_frames)
-    end = min(len(corr), center + max_shift_frames + 1)
-    
-    window = corr[start:end]
-    if len(window) == 0:
-        return 0
-        
-    best_idx = np.argmax(window)
-    # Convert back to shift relative to 'center'
-    # NOTE: If shift_frames is positive, B is 'earlier' than A, so we need to delay B.
-    # If shift_frames is negative, B is 'later' than A, so we need to trim B.
-    shift_frames = (start + best_idx) - center
-    
-    # We return the negative so that:
-    # Positive result -> trim B (B was late)
-    # Negative result -> add silence to B (B was early)
-    return int(-shift_frames * hop_length)
-
-
-def _render_full_blend(
-    y_a: np.ndarray,
-    y_b: np.ndarray,
-    sr: int,
-    comp: CompatibilityResult,
-    gain_db_b: float,
-    config: MashupConfig,
-) -> np.ndarray:
-    """Standard full blend: both tracks mixed together."""
-    y_b = time_stretch_audio(y_b, comp.stretch_factor_b)
-    y_b = pitch_shift_audio(y_b, sr, comp.pitch_shift_b)
-    y_a = apply_gain_db(y_a, config.gain_db_a)
-    y_b = apply_gain_db(y_b, gain_db_b)
-
-    # Beat-align B to A
-    offset = _beat_align_offset(y_a, y_b, sr)
-    if offset > 0 and offset < len(y_b):
-        y_b = y_b[offset:]
-    elif offset < 0:
-        silence = np.zeros(-offset, dtype=np.float32)
-        y_b = np.concatenate([silence, y_b])
-
-    return overlay_audio(y_a, y_b)
-
-
-def _render_with_stems(
-    path_a: str,
-    path_b: str,
-    mode: str,
-    comp: CompatibilityResult,
-    start_a: float,
-    start_b: float,
-    clip_duration: float,
-    gain_db_b: float,
-    sr: int,
-    stems_dir: Optional[str],
-    config: MashupConfig,
-) -> np.ndarray:
-    """Stem-separated render: vocals from one track, instrumental from other."""
-    from source_separation import separate_track, blend_stems
-
-    tmpdir = stems_dir or tempfile.mkdtemp(prefix="mashup_stems_")
-    
-    if stems_dir:
-        os.makedirs(stems_dir, exist_ok=True)
-
-    # PRE-CLIP the audio before Demucs so it only takes seconds instead of minutes
-    y_a, sr_a = load_audio(path_a, sr=sr)
-    y_b, sr_b = load_audio(path_b, sr=sr)
-    
-    clip_a_raw = trim_audio(y_a, sr, start_a, clip_duration)
-    clip_b_raw = trim_audio(y_b, sr, start_b, clip_duration)
+    tmpdir: str,
+):
+    from source_separation import blend_stems, separate_track
 
     clip_a_path = os.path.join(tmpdir, "clip_a.wav")
     clip_b_path = os.path.join(tmpdir, "clip_b.wav")
     export_wav(clip_a_raw, sr, clip_a_path)
     export_wav(clip_b_raw, sr, clip_b_path)
 
-    # NEW: Find alignment offset using the TEMPO-SYNCED raw segments.
-    # We must stretch Track B raw before comparing it to Track A.
-    clip_b_raw_stretched = time_stretch_audio(clip_b_raw, comp.stretch_factor_b)
-    alignment_offset = _beat_align_offset(clip_a_raw, clip_b_raw_stretched, sr)
+    # Fast 2-stem mode: vocals + no_vocals.
+    stems_a = separate_track(clip_a_path, out_dir=os.path.join(tmpdir, "a"), sr=sr, four_stem=False)
+    stems_b = separate_track(clip_b_path, out_dir=os.path.join(tmpdir, "b"), sr=sr, four_stem=False)
 
-    stems_a = separate_track(clip_a_path, out_dir=os.path.join(tmpdir, "a"), sr=sr, four_stem=True)
-    stems_b = separate_track(clip_b_path, out_dir=os.path.join(tmpdir, "b"), sr=sr, four_stem=True)
+    vocals_a = stems_a.get("vocals")
+    vocals_b = stems_b.get("vocals")
+    # In 2-stem mode, source_separation stores no_vocals in drums.
+    inst_a, _ = blend_stems(stems_a, ["drums"], normalize=False)
+    inst_b, _ = blend_stems(stems_b, ["drums"], normalize=False)
+    return vocals_a, inst_a, vocals_b, inst_b
 
-    # Save all 4 stems to the session's stems_dir for user inspection
+
+
+def _window_onset_corr(a: np.ndarray, b: np.ndarray, max_lag_frames: int) -> float:
+    if len(a) == 0 or len(b) == 0:
+        return 0.0
+    a = a.astype(np.float32)
+    b = b.astype(np.float32)
+    a = (a - float(np.mean(a))) / (float(np.std(a)) + 1e-9)
+    b = (b - float(np.mean(b))) / (float(np.std(b)) + 1e-9)
+    corr = np.correlate(a, b, mode="full")
+    center = len(b) - 1
+    lo = max(0, center - max_lag_frames)
+    hi = min(len(corr), center + max_lag_frames + 1)
+    if hi <= lo:
+        return 0.0
+    best = float(np.max(corr[lo:hi]))
+    norm = (float(np.linalg.norm(a)) * float(np.linalg.norm(b))) + 1e-9
+    return float(np.clip(best / norm, 0.0, 1.0))
+
+
+def _pick_short_sync_window(
+    path_a: str,
+    path_b: str,
+    clip_duration: float,
+    analysis_sr: int = 12000,
+) -> Tuple[float, float, float, float]:
+    """
+    Pick short windows where local tempo is close and onset pulses align.
+    Returns: (start_a_s, start_b_s, local_tempo_a, local_tempo_b)
+    """
+    y_a, _ = load_audio(path_a, sr=analysis_sr)
+    y_b, _ = load_audio(path_b, sr=analysis_sr)
+
+    scan_limit = int(180.0 * analysis_sr)
+    y_a = y_a[:scan_limit]
+    y_b = y_b[:scan_limit]
+
+    hop = 512
+    env_a = librosa.onset.onset_strength(y=y_a, sr=analysis_sr, hop_length=hop).astype(np.float32)
+    env_b = librosa.onset.onset_strength(y=y_b, sr=analysis_sr, hop_length=hop).astype(np.float32)
+    tempo_curve_a = np.ravel(
+        librosa.feature.tempo(onset_envelope=env_a, sr=analysis_sr, hop_length=hop, aggregate=None)
+    )
+    tempo_curve_b = np.ravel(
+        librosa.feature.tempo(onset_envelope=env_b, sr=analysis_sr, hop_length=hop, aggregate=None)
+    )
+
+    frames_clip = max(8, int(clip_duration * analysis_sr / hop))
+    step_frames = max(1, int(4.0 * analysis_sr / hop))
+    max_start_a = max(0, len(env_a) - frames_clip)
+    max_start_b = max(0, len(env_b) - frames_clip)
+    starts_a = list(range(0, max_start_a + 1, step_frames)) or [0]
+    starts_b = list(range(0, max_start_b + 1, step_frames)) or [0]
+
+    def _local_tempo(curve: np.ndarray, i0: int, i1: int, fallback: float) -> float:
+        w = curve[i0:i1]
+        w = w[np.isfinite(w)]
+        if len(w) == 0:
+            return fallback
+        return float(np.median(w))
+
+    global_tempo_a = float(np.nanmedian(tempo_curve_a)) if len(tempo_curve_a) else 120.0
+    global_tempo_b = float(np.nanmedian(tempo_curve_b)) if len(tempo_curve_b) else 120.0
+    tempos_a = [_local_tempo(tempo_curve_a, s, s + frames_clip, global_tempo_a) for s in starts_a]
+    tempos_b = [_local_tempo(tempo_curve_b, s, s + frames_clip, global_tempo_b) for s in starts_b]
+
+    best_score = -1.0
+    best = (0.0, 0.0, global_tempo_a, global_tempo_b)
+    lag_cap = int(1.5 * analysis_sr / hop)
+    tempos_b_arr = np.array(tempos_b, dtype=np.float32)
+
+    for i, sa in enumerate(starts_a):
+        ta = max(1e-6, float(tempos_a[i]))
+        tempo_diffs = np.abs(tempos_b_arr - ta) / ta
+        top_b = np.argsort(tempo_diffs)[: min(4, len(starts_b))]
+        win_a = env_a[sa : sa + frames_clip]
+        for j in top_b:
+            sb = starts_b[int(j)]
+            tb = max(1e-6, float(tempos_b[int(j)]))
+            tempo_score = float(max(0.0, 1.0 - min(1.0, abs(tb - ta) / ta)))
+            beat_score = _window_onset_corr(win_a, env_b[sb : sb + frames_clip], lag_cap)
+            combined = 0.7 * tempo_score + 0.3 * beat_score
+            if combined > best_score:
+                best_score = combined
+                best = (
+                    float(sa * hop / analysis_sr),
+                    float(sb * hop / analysis_sr),
+                    ta,
+                    tb,
+                )
+    return best
+
+
+def _eq_vocal(vocal: np.ndarray, sr: int) -> np.ndarray:
+    """
+    Vocals EQ:
+    - high-pass below 120 Hz
+    - slight presence boost around 3-5 kHz
+    """
+    from scipy.signal import butter, lfilter
+
+    y = high_pass_filter(vocal, sr, cutoff=120.0)
+    nyq = 0.5 * sr
+    lo = max(10.0, 3000.0) / max(nyq, 1e-9)
+    hi = min(0.99, 5000.0 / max(nyq, 1e-9))
+    if lo < hi:
+        b, a = butter(2, [lo, hi], btype="band")
+        band = lfilter(b, a, y).astype(np.float32)
+        y = (y + 0.12 * band).astype(np.float32)
+    return y.astype(np.float32)
+
+
+def _eq_instrumental(inst: np.ndarray, sr: int) -> np.ndarray:
+    """
+    Instrumental EQ:
+    - slight cut 300-500 Hz
+    - slight cut 2-4 kHz
+    """
+    from scipy.signal import butter, lfilter
+
+    y = inst.astype(np.float32)
+    nyq = 0.5 * sr
+    for lo_hz, hi_hz, amount in ((300.0, 500.0, 0.10), (2000.0, 4000.0, 0.10)):
+        lo = max(10.0, lo_hz) / max(nyq, 1e-9)
+        hi = min(0.99, hi_hz / max(nyq, 1e-9))
+        if lo < hi:
+            b, a = butter(2, [lo, hi], btype="band")
+            band = lfilter(b, a, y).astype(np.float32)
+            y = (y - amount * band).astype(np.float32)
+    return y.astype(np.float32)
+
+
+def _match_rms_to_target(y: np.ndarray, target_rms: float) -> np.ndarray:
+    rms = float(np.sqrt(np.mean(np.square(y))) + 1e-9)
+    if rms <= 0.0 or target_rms <= 0.0:
+        return y.astype(np.float32)
+    gain = target_rms / rms
+    return (y * gain).astype(np.float32)
+
+
+def _mix_equal_db(instrumental: np.ndarray, vocal: np.ndarray) -> np.ndarray:
+    target_len = max(len(instrumental), len(vocal))
+    inst = pad_or_trim_to_length(instrumental, target_len)
+    voc = pad_or_trim_to_length(vocal, target_len)
+    target_rms = 0.5 * (
+        float(np.sqrt(np.mean(np.square(inst))) + 1e-9) + float(np.sqrt(np.mean(np.square(voc))) + 1e-9)
+    )
+    inst = _match_rms_to_target(inst, target_rms)
+    voc = _match_rms_to_target(voc, target_rms)
+    mixed = inst + voc
+    return normalize_peak(mixed, peak=0.92)
+
+
+def _onset_offset_and_score(
+    master: np.ndarray,
+    reference: np.ndarray,
+    sr: int,
+    max_offset_s: float = MAX_MANUAL_OFFSET_S,
+) -> Tuple[int, float]:
+    """
+    Find a global offset (in samples) that maximizes beat/onset overlap.
+    No time-stretching and no pitch shifting.
+    """
+    hop = 512
+    env_master = librosa.onset.onset_strength(y=master, sr=sr, hop_length=hop)
+    env_ref = librosa.onset.onset_strength(y=reference, sr=sr, hop_length=hop)
+
+    if len(env_master) == 0 or len(env_ref) == 0:
+        return 0, 0.0
+
+    env_master = env_master.astype(np.float32)
+    env_ref = env_ref.astype(np.float32)
+    env_master = (env_master - float(np.mean(env_master))) / (float(np.std(env_master)) + 1e-9)
+    env_ref = (env_ref - float(np.mean(env_ref))) / (float(np.std(env_ref)) + 1e-9)
+
+    corr = np.correlate(env_master, env_ref, mode="full")
+    center = len(env_ref) - 1
+    max_lag = min(int(max_offset_s * sr / hop), min(len(env_master), len(env_ref)) - 1)
+    lo = max(0, center - max_lag)
+    hi = min(len(corr), center + max_lag + 1)
+    if hi <= lo:
+        return 0, 0.0
+
+    window = corr[lo:hi]
+    best_lag = int(np.argmax(window)) + lo - center
+
+    # Also test likely downbeat disagreements: +/- half beat and +/- one beat.
+    tempo_arr = librosa.feature.tempo(onset_envelope=env_master, sr=sr, hop_length=hop, aggregate=np.median)
+    tempo_bpm = float(np.ravel(tempo_arr)[0]) if np.size(tempo_arr) else 120.0
+    beat_frames = max(1, int(round((60.0 / max(tempo_bpm, 1e-6)) * sr / hop)))
+    candidate_lags = [
+        best_lag,
+        best_lag - beat_frames,
+        best_lag + beat_frames,
+        best_lag - (beat_frames // 2),
+        best_lag + (beat_frames // 2),
+    ]
+
+    def _corr_at_lag(lag: int) -> float:
+        idx = center + lag
+        if idx < 0 or idx >= len(corr):
+            return -1e9
+        return float(corr[idx])
+
+    best_lag = max(candidate_lags, key=_corr_at_lag)
+    norm = (float(np.linalg.norm(env_master)) * float(np.linalg.norm(env_ref))) + 1e-9
+    score = _corr_at_lag(best_lag) / norm
+    offset_samples = int(best_lag * hop)
+    return offset_samples, float(np.clip(score, 0.0, 1.0))
+
+
+def _align_vocal_to_master(
+    instrumental_master: np.ndarray,
+    rhythm_reference: np.ndarray,
+    vocal: np.ndarray,
+    sr: int,
+) -> Tuple[np.ndarray, float]:
+    """
+    Aligns the vocal stem to the instrumental using onset cross-correlation.
+    Returns (aligned_vocal, beat_lock_score).
+    """
+    beat_offset, beat_sync_score = _onset_offset_and_score(
+        instrumental_master, rhythm_reference, sr, max_offset_s=MAX_MANUAL_OFFSET_S
+    )
+
+    # Clean the vocal stem by removing leading dead air from separator output.
+    vocal, vocal_silence_offset = trim_leading_silence(vocal, sr, top_db=35.0)
+    aligned_vocal = shift_audio(vocal, beat_offset - vocal_silence_offset, target_len=len(instrumental_master))
+    return aligned_vocal.astype(np.float32), float(beat_sync_score)
+
+
+
+def _render_with_stems(
+    path_a: str,
+    path_b: str,
+    mode: str,
+    start_a: float,
+    start_b: float,
+    clip_duration: float,
+    sr: int,
+    stems_dir: Optional[str],
+    config: MashupConfig,
+) -> Tuple[np.ndarray, float]:
+    tmpdir = stems_dir or tempfile.mkdtemp(prefix="mashup_stems_")
+    os.makedirs(tmpdir, exist_ok=True)
     if stems_dir:
         os.makedirs(stems_dir, exist_ok=True)
-        # Mix the instrumental components for both tracks
-        from source_separation import blend_stems
-        inst_a, _ = blend_stems(stems_a, ["drums", "bass", "other"])
-        inst_b, _ = blend_stems(stems_b, ["drums", "bass", "other"])
-        
-        export_wav(stems_a.get("vocals"), sr, os.path.join(stems_dir, "track_a_vocals.wav"))
+
+    y_a, _ = load_audio(path_a, sr=sr)
+    y_b, _ = load_audio(path_b, sr=sr)
+    clip_a_raw = trim_audio(y_a, sr, start_a, clip_duration)
+    clip_b_raw = trim_audio(y_b, sr, start_b, clip_duration)
+
+    vocals_a, inst_a, vocals_b, inst_b = _separate_clips(clip_a_raw, clip_b_raw, sr, tmpdir)
+
+    if stems_dir:
+        export_wav(vocals_a, sr, os.path.join(stems_dir, "track_a_vocals.wav"))
         export_wav(inst_a, sr, os.path.join(stems_dir, "track_a_instrumental.wav"))
-        export_wav(stems_b.get("vocals"), sr, os.path.join(stems_dir, "track_b_vocals.wav"))
+        export_wav(vocals_b, sr, os.path.join(stems_dir, "track_b_vocals.wav"))
         export_wav(inst_b, sr, os.path.join(stems_dir, "track_b_instrumental.wav"))
-        
-        # Also log that we saved them
-        print(f"DEBUG: Saved 4 stems to {stems_dir}")
 
-    # ROUTING LOGIC: Strictly enforce "one track lyrics, OTHER track instrumental"
-    if mode == "vocals_a_inst_b" or mode == "vocals_over_instrumental":
-        print(f"DEBUG: Routing A-Vocals + B-Instrumental")
-        layer_a, _ = blend_stems(stems_a, ["vocals"])
-        layer_b, _ = blend_stems(stems_b, ["drums", "bass", "other"]) 
-        
-        # High-pass filter the vocals to remove original kick/bass bleed
-        layer_a = high_pass_filter(layer_a, sr, cutoff=180.0)
-        
-        # Soft Noise Gate
-        gate_threshold = 0.005 
-        layer_a[np.abs(layer_a) < gate_threshold] = 0.0
-        
-        # FIXED GAIN logic for stems: 
-        # Beat (B) should be slightly louder than Vocals (A)
-        layer_a = normalize_peak(layer_a, peak=0.7)
-        layer_b = normalize_peak(layer_b, peak=0.9)
-        gain_db_b = 0.0 # Stems already balanced by normalization above
-
-    elif mode == "inst_a_vocals_b":
-        print(f"DEBUG: Routing A-Instrumental + B-Vocals")
-        layer_a, _ = blend_stems(stems_a, ["drums", "bass", "other"])
-        layer_b, _ = blend_stems(stems_b, ["vocals"])
-        
-        layer_b = high_pass_filter(layer_b, sr, cutoff=180.0)
-        
-        gate_threshold = 0.005
-        layer_b[np.abs(layer_b) < gate_threshold] = 0.0
-
-        # FIXED GAIN logic for stems: Beat (A) vs Vocals (B)
-        layer_a = normalize_peak(layer_a, peak=0.9)
-        layer_b = normalize_peak(layer_b, peak=0.7)
-        gain_db_b = 0.0
-
+    if mode == "vocals_a_inst_b":
+        instrumental = inst_b
+        rhythm_reference = clip_a_raw
+        vocal = vocals_a
     else:
-        # Fallback/Acapella mode: A-Vocals + B-Mixed (everything)
-        print(f"DEBUG: Routing A-Vocals + B-Mixed (Acapella mode)")
-        layer_a, _ = blend_stems(stems_a, ["vocals"])
-        layer_b, _ = blend_stems(stems_b, ["vocals", "drums", "bass", "other"])
-        
-        layer_a = high_pass_filter(layer_a, sr, cutoff=180.0)
-        
-        layer_a = normalize_peak(layer_a, peak=0.7)
-        layer_b = normalize_peak(layer_b, peak=0.8)
-        gain_db_b = 0.0
+        instrumental = inst_a
+        rhythm_reference = clip_b_raw
+        vocal = vocals_b
 
-    clip_a = layer_a
-    clip_b = layer_b
+    aligned_vocal, beat_sync_score = _align_vocal_to_master(
+        instrumental_master=instrumental,
+        rhythm_reference=rhythm_reference,
+        vocal=vocal,
+        sr=sr,
+    )
 
-    clip_b = time_stretch_audio(clip_b, comp.stretch_factor_b)
-    clip_b = pitch_shift_audio(clip_b, sr, comp.pitch_shift_b)
-    clip_a = apply_gain_db(clip_a, config.gain_db_a)
-    clip_b = apply_gain_db(clip_b, gain_db_b)
+    # Apply separation EQ to avoid masking/muffling.
+    inst_eq = _eq_instrumental(instrumental, sr)
+    vocal_eq = _eq_vocal(aligned_vocal, sr)
 
-    # Use the pre-calculated offset
-    offset = alignment_offset
-    if offset > 0 and offset < len(clip_b):
-        clip_b = clip_b[offset:]
-    elif offset < 0:
-        silence = np.zeros(-offset, dtype=np.float32)
-        clip_b = np.concatenate([silence, clip_b])
+    # Match vocal/instrumental loudness (equal dB proxy via RMS) before summing.
+    mixed = _mix_equal_db(inst_eq, vocal_eq)
+    return mixed, beat_sync_score
 
-    return overlay_audio(clip_a, clip_b)
-
-
-# ---------------------------------------------------------------------------
-# Engine
-# ---------------------------------------------------------------------------
 
 class MashupEngine:
     def run(self, config: MashupConfig) -> MashupResult:
         try:
             return self._run(config)
-        except Exception as e:
+        except Exception as exc:
             import traceback
+
             return MashupResult(
                 success=False,
                 wav_out=config.wav_out,
                 mp3_out=config.mp3_out,
-                compatibility=None,  # type: ignore
+                compatibility=CompatibilityResult(
+                    compatibility_score=0.0,
+                    grade="F",
+                    embedding_similarity=0.0,
+                    camelot_key_score=0.0,
+                    tempo_similarity=0.0,
+                    energy_similarity=0.0,
+                    tempo_score=0.0,
+                    key_score=0.0,
+                    energy_score=0.0,
+                    loudness_score=0.0,
+                    timbre_score=0.0,
+                    spectral_contrast_score=0.0,
+                    tonnetz_score=0.0,
+                    danceability_match_score=0.0,
+                    tempo_ratio_used=1.0,
+                    stretch_factor_b=1.0,
+                    stretch_pct_b=0.0,
+                    pitch_shift_b=0,
+                    gain_db_b=0.0,
+                    mashup_type="inst_a_vocals_b",
+                    layerable=False,
+                    reject_reasons=[str(exc)],
+                    summary=str(exc),
+                ),
                 start_a=0.0,
                 start_b=0.0,
                 segment_score_a=0.0,
@@ -356,118 +508,111 @@ class MashupEngine:
                 track_a_features={},
                 track_b_features={},
                 summary="",
-                error=f"{e}\n{traceback.format_exc()}",
+                error=f"{exc}\n{traceback.format_exc()}",
             )
 
     def _run(self, config: MashupConfig) -> MashupResult:
-        # ── Step 1: Analyze tracks ───────────────────────────────────────────
-        feats_a = analyze_mp3(config.track_a, target_sr=22050)
-        feats_b = analyze_mp3(config.track_b, target_sr=22050)
+        clip_duration = float(np.clip(config.clip_duration, 18.0, 24.0))
+        feats_a = config.track_a_features or analyze_mp3(
+            config.track_a,
+            target_sr=16000,
+            analysis_window_s=60.0,
+            use_middle_window=True,
+            fast_mode=True,
+        )
+        feats_b = config.track_b_features or analyze_mp3(
+            config.track_b,
+            target_sr=16000,
+            analysis_window_s=60.0,
+            use_middle_window=True,
+            fast_mode=True,
+        )
 
-        # ── Step 2: Compatibility scoring ────────────────────────────────────
-        comp = compare_tracks(feats_a, feats_b)
+        comp_ab = compare_tracks(feats_a, feats_b)
+        comp_ba = compare_tracks(feats_b, feats_a)
 
-        # ── Step 3: Find best segments ───────────────────────────────────────
         if config.start_a is not None and config.start_b is not None:
-            start_a, seg_score_a = config.start_a, 1.0
-            start_b, seg_score_b = config.start_b, 1.0
+            start_a = float(config.start_a)
+            start_b = float(config.start_b)
         else:
-            start_a, seg_score_a, start_b, seg_score_b = pick_best_aligned_segments(
+            start_a, start_b, _, _ = _pick_short_sync_window(
                 config.track_a,
                 config.track_b,
-                clip_duration=config.clip_duration,
-                n_candidates=config.n_segment_candidates,
-                sr=22050,
+                clip_duration=clip_duration,
+                analysis_sr=12000,
             )
-            if config.start_a is not None:
-                start_a, seg_score_a = config.start_a, 1.0
-            if config.start_b is not None:
-                start_b, seg_score_b = config.start_b, 1.0
+        seg_score_a = 1.0
+        seg_score_b = 1.0
 
-        # ── Step 4: Decide blend mode ─────────────────────────────────────────
-        mode = config.mashup_mode
-        if mode == "auto":
-            mode = comp.mashup_type
-            # If stem separation off, fall back to full_blend
-            if not config.use_stem_separation and mode in (
-                "vocals_a_inst_b", "inst_a_vocals_b", "acapella_over_beat", "vocals_over_instrumental"
-            ):
-                mode = "full_blend"
-                
-            # If stem separation ON, but mode is full_blend, force separation mode
-            if config.use_stem_separation and mode == "full_blend":
-                mode = "vocals_a_inst_b"
+        decision = _choose_direction(comp_ab, comp_ba, config.mashup_mode)
+        reject_reasons = list(decision.reject_reasons)
 
-        gain_db_b = config.gain_db_b if config.gain_db_b is not None else comp.gain_db_b
+        if not config.use_stem_separation:
+            reject_reasons.append("stem separation must be enabled")
 
-        # ── Step 5: Render ───────────────────────────────────────────────────
-        if config.use_stem_separation and mode in (
-            "vocals_a_inst_b", "inst_a_vocals_b", "acapella_over_beat", "vocals_over_instrumental"
-        ):
-            mixed = _render_with_stems(
-                config.track_a, config.track_b,
-                mode=mode,
-                comp=comp,
-                start_a=start_a,
-                start_b=start_b,
-                clip_duration=config.clip_duration,
-                gain_db_b=gain_db_b,
-                sr=config.sr,
-                stems_dir=config.stems_dir,
-                config=config,
+        if reject_reasons and ENFORCE_STRICT_REJECTION:
+            raise ValueError(_reject_summary(reject_reasons))
+
+        warnings: List[str] = []
+        if reject_reasons:
+            warnings.append("Ignored compatibility checks: " + "; ".join(reject_reasons))
+
+        mixed, beat_sync_score = _render_with_stems(
+            config.track_a,
+            config.track_b,
+            mode=decision.mode,
+            start_a=start_a,
+            start_b=start_b,
+            clip_duration=clip_duration,
+            sr=config.sr,
+            stems_dir=config.stems_dir,
+            config=config,
+        )
+
+        if beat_sync_score < MIN_BEAT_SYNC_SCORE:
+            msg = (
+                f"beat grids do not lock cleanly enough "
+                f"(score {beat_sync_score:.2f}, target {MIN_BEAT_SYNC_SCORE:.2f})"
             )
-        else:
-            # Standard full blend
-            y_a, sr_a = load_audio(config.track_a, sr=config.sr)
-            y_b, sr_b = load_audio(config.track_b, sr=config.sr)
+            if ENFORCE_MIN_BEAT_SYNC:
+                raise ValueError(_reject_summary([msg]))
+            warnings.append(msg)
 
-            clip_a = trim_audio(y_a, config.sr, start_a, config.clip_duration)
-            clip_b = trim_audio(y_b, config.sr, start_b, config.clip_duration)
-
-            mixed = _render_full_blend(
-                clip_a, clip_b,
-                sr=config.sr,
-                comp=comp,
-                gain_db_b=gain_db_b,
-                config=config,
-            )
-
-        # ── Step 6: Fade & normalize ─────────────────────────────────────────
         mixed = _apply_fade(mixed, config.sr, config.fade_in_s, config.fade_out_s)
         mixed = normalize_peak(mixed, peak=0.92)
 
-        # ── Step 7: Export ───────────────────────────────────────────────────
         os.makedirs(os.path.dirname(os.path.abspath(config.wav_out)), exist_ok=True)
         export_wav(mixed, config.sr, config.wav_out)
 
         mp3_out = None
         if config.mp3_out:
             from audio_render import export_mp3_via_pydub
+
             export_mp3_via_pydub(config.wav_out, config.mp3_out)
             mp3_out = config.mp3_out
 
-        # ── Step 8: Build result ─────────────────────────────────────────────
-        summary_lines = [
-            comp.summary,
-            f"Energy Match: {((seg_score_a + seg_score_b)/2 * 100):.0f}% intensity.",
-            f"Clip: Track A starts at {start_a:.1f}s, Track B at {start_b:.1f}s.",
-            f"Duration: {config.clip_duration:.0f}s | Mode: {mode.replace('_',' ').title()}.",
-        ]
-        if config.use_stem_separation:
-            summary_lines.append("Stem separation was applied.")
+        summary = (
+            f"Accepted. Mode: {decision.mode}. "
+            f"Sync: short-window tempo+onset match. "
+            f"Vocal tempo scale: +0.0% (disabled). "
+            f"Beat lock score: {beat_sync_score:.2f}. "
+            f"Clip duration: {clip_duration:.1f}s."
+        )
+        if warnings:
+            summary += " " + " ".join(warnings)
 
         return MashupResult(
             success=True,
             wav_out=config.wav_out,
             mp3_out=mp3_out,
-            compatibility=comp,
+            compatibility=decision.comp,
             start_a=start_a,
             start_b=start_b,
             segment_score_a=seg_score_a,
             segment_score_b=seg_score_b,
-            mashup_mode_used=mode,
-            stem_separation_used=config.use_stem_separation,
+            mashup_mode_used=decision.mode,
+            stem_separation_used=True,
             track_a_features=as_json_dict(feats_a),
             track_b_features=as_json_dict(feats_b),
-            summary=" ".join(summary_lines),
+            summary=summary,
         )

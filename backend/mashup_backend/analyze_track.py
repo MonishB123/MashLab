@@ -50,7 +50,14 @@ KS_MINOR = np.array([6.33, 2.68, 3.52, 5.38, 2.60, 3.53,
 
 
 def safe_float(x: Any) -> float:
-    return float(x) if x is not None else float("nan")
+    if x is None:
+        return float("nan")
+    arr = np.asarray(x)
+    if arr.size == 0:
+        return float("nan")
+    if arr.ndim == 0:
+        return float(arr)
+    return float(np.mean(arr))
 
 
 def safe_list(x: np.ndarray, max_len: Optional[int] = None) -> List[float]:
@@ -316,6 +323,7 @@ class TrackFeatures:
     mfcc_mean: List[float]
     mfcc_std: List[float]
     spectral_contrast_mean: List[float]
+    spectral_centroid_hz: float
 
     # Energy / loudness
     rms_mean: float
@@ -340,27 +348,58 @@ def analyze_mp3(
     hop_length: int = 512,
     n_mfcc: int = 20,
     curve_max_points: int = 600,
+    analysis_window_s: float = 90.0,
+    use_middle_window: bool = True,
+    fast_mode: bool = True,
 ) -> TrackFeatures:
-    y, sr = librosa.load(path, sr=target_sr, mono=mono)
-    duration_s = float(len(y) / sr)
+    full_duration_s = float(librosa.get_duration(path=path))
+
+    offset_s = 0.0
+    load_duration_s: Optional[float] = None
+    if use_middle_window and analysis_window_s > 0 and full_duration_s > analysis_window_s:
+        offset_s = max(0.0, (full_duration_s - analysis_window_s) * 0.5)
+        load_duration_s = analysis_window_s
+
+    y, sr = librosa.load(
+        path,
+        sr=target_sr,
+        mono=mono,
+        offset=offset_s,
+        duration=load_duration_s,
+    )
+    duration_s = full_duration_s
 
     # Rhythm
     tempo, beat_frames = librosa.beat.beat_track(y=y, sr=sr, hop_length=hop_length)
-    beat_times = librosa.frames_to_time(beat_frames, sr=sr, hop_length=hop_length)
+    tempo_bpm = safe_float(tempo)
+    beat_times = librosa.frames_to_time(beat_frames, sr=sr, hop_length=hop_length) + offset_s
 
     # Harmony
-    chroma = librosa.feature.chroma_cqt(y=y, sr=sr, hop_length=hop_length)
+    if fast_mode:
+        chroma = librosa.feature.chroma_stft(y=y, sr=sr, hop_length=hop_length, n_fft=2048)
+    else:
+        chroma = librosa.feature.chroma_cqt(y=y, sr=sr, hop_length=hop_length)
     chroma_mean = np.mean(chroma, axis=1)
     chroma_norm = chroma_mean / (np.sum(chroma_mean) + 1e-9)
 
     key_pc, key_name, mode, mode_name = estimate_key_and_mode(chroma_norm)
-    tonnetz_mean = compute_tonnetz(y, sr)
-
-    # Timbre
-    mfcc = librosa.feature.mfcc(y=y, sr=sr, hop_length=hop_length, n_mfcc=n_mfcc)
-    mfcc_mean = np.mean(mfcc, axis=1)
-    mfcc_std = np.std(mfcc, axis=1)
-    spectral_contrast_mean = compute_spectral_contrast(y, sr, hop_length=hop_length)
+    if fast_mode:
+        tonnetz_mean = [0.0] * 6
+        mfcc_mean = np.zeros(n_mfcc, dtype=float)
+        mfcc_std = np.zeros(n_mfcc, dtype=float)
+        spectral_contrast_mean = [0.0] * 7
+        spectral_centroid_hz = float(
+            np.mean(librosa.feature.spectral_centroid(y=y, sr=sr, hop_length=hop_length)[0])
+        )
+    else:
+        tonnetz_mean = compute_tonnetz(y, sr)
+        mfcc = librosa.feature.mfcc(y=y, sr=sr, hop_length=hop_length, n_mfcc=n_mfcc)
+        mfcc_mean = np.mean(mfcc, axis=1)
+        mfcc_std = np.std(mfcc, axis=1)
+        spectral_contrast_mean = compute_spectral_contrast(y, sr, hop_length=hop_length)
+        spectral_centroid_hz = float(
+            np.mean(librosa.feature.spectral_centroid(y=y, sr=sr, hop_length=hop_length)[0])
+        )
 
     # Energy
     rms = librosa.feature.rms(y=y, hop_length=hop_length)[0]
@@ -377,16 +416,29 @@ def analyze_mp3(
         return arr[idx]
 
     # Vocal / texture features
-    speechiness = compute_speechiness(y, sr, mfcc, hop_length)
-    instrumentalness = compute_instrumentalness(y, speechiness)
-    hp_ratio = compute_hp_ratio(y)
-    danceability = compute_danceability(y, sr, float(tempo), beat_frames, hop_length)
+    if fast_mode:
+        onset_env = librosa.onset.onset_strength(y=y, sr=sr, hop_length=hop_length)
+        beat_strength = 0.0
+        if len(beat_frames) > 0 and len(onset_env) > 0:
+            valid_frames = beat_frames[beat_frames < len(onset_env)]
+            if len(valid_frames) > 0:
+                beat_strength = float(np.mean(onset_env[valid_frames]) / (np.mean(onset_env) + 1e-9))
+        danceability = float(np.clip(beat_strength, 0.0, 1.0))
+        speechiness = 0.0
+        instrumentalness = 0.0
+        hp_ratio = 0.0
+    else:
+        mfcc = librosa.feature.mfcc(y=y, sr=sr, hop_length=hop_length, n_mfcc=n_mfcc)
+        speechiness = compute_speechiness(y, sr, mfcc, hop_length)
+        instrumentalness = compute_instrumentalness(y, speechiness)
+        hp_ratio = compute_hp_ratio(y)
+        danceability = compute_danceability(y, sr, tempo_bpm, beat_frames, hop_length)
 
     return TrackFeatures(
         path=path,
         sr=sr,
         duration_s=duration_s,
-        tempo_bpm=safe_float(tempo),
+        tempo_bpm=tempo_bpm,
         beat_times_s=safe_list(beat_times),
         danceability=danceability,
         chroma_mean=safe_list(chroma_norm),
@@ -398,6 +450,7 @@ def analyze_mp3(
         mfcc_mean=safe_list(mfcc_mean),
         mfcc_std=safe_list(mfcc_std),
         spectral_contrast_mean=spectral_contrast_mean,
+        spectral_centroid_hz=spectral_centroid_hz,
         rms_mean=rms_mean,
         rms_std=rms_std,
         loudness_db_mean=loud_db_mean,
@@ -432,6 +485,7 @@ def as_json_dict(features: TrackFeatures) -> Dict[str, Any]:
             "mfcc_mean": features.mfcc_mean,
             "mfcc_std": features.mfcc_std,
             "spectral_contrast_mean": features.spectral_contrast_mean,
+            "spectral_centroid_hz": features.spectral_centroid_hz,
         },
         "energy": {
             "rms_mean": features.rms_mean,
@@ -449,6 +503,42 @@ def as_json_dict(features: TrackFeatures) -> Dict[str, Any]:
             "hp_ratio": features.hp_ratio,
         },
     }
+
+
+def from_json_dict(payload: Dict[str, Any]) -> TrackFeatures:
+    rhythm = payload.get("rhythm", {})
+    harmony = payload.get("harmony", {})
+    timbre = payload.get("timbre", {})
+    energy = payload.get("energy", {})
+    vocal = payload.get("vocal_content", {})
+    texture = payload.get("texture", {})
+    return TrackFeatures(
+        path=str(payload.get("path", "")),
+        sr=int(payload.get("sr", 22050)),
+        duration_s=float(payload.get("duration_s", 0.0)),
+        tempo_bpm=safe_float(rhythm.get("tempo_bpm")),
+        beat_times_s=[safe_float(v) for v in rhythm.get("beat_times_s", [])],
+        danceability=safe_float(rhythm.get("danceability")),
+        chroma_mean=[safe_float(v) for v in harmony.get("chroma_mean", [])],
+        key_pc_guess=int(harmony.get("key_pc_guess", 0)),
+        key_name_guess=str(harmony.get("key_name_guess", "C")),
+        mode=int(harmony.get("mode", 0)),
+        mode_name=str(harmony.get("mode_name", "major")),
+        tonnetz_mean=[safe_float(v) for v in harmony.get("tonnetz_mean", [])],
+        mfcc_mean=[safe_float(v) for v in timbre.get("mfcc_mean", [])],
+        mfcc_std=[safe_float(v) for v in timbre.get("mfcc_std", [])],
+        spectral_contrast_mean=[safe_float(v) for v in timbre.get("spectral_contrast_mean", [])],
+        spectral_centroid_hz=safe_float(timbre.get("spectral_centroid_hz", 0.0)),
+        rms_mean=safe_float(energy.get("rms_mean")),
+        rms_std=safe_float(energy.get("rms_std")),
+        loudness_db_mean=safe_float(energy.get("loudness_db_mean")),
+        loudness_db_std=safe_float(energy.get("loudness_db_std")),
+        rms_curve=[safe_float(v) for v in energy.get("rms_curve", [])],
+        loudness_db_curve=[safe_float(v) for v in energy.get("loudness_db_curve", [])],
+        speechiness=safe_float(vocal.get("speechiness")),
+        instrumentalness=safe_float(vocal.get("instrumentalness")),
+        hp_ratio=safe_float(texture.get("hp_ratio")),
+    )
 
 
 def main() -> None:

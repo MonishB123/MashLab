@@ -97,11 +97,13 @@ def score_windows(
 
 def find_best_segments(
     audio_path: str,
-    clip_duration: float = 30.0,
+    clip_duration: float = 45.0,
     n_candidates: int = 3,
     sr: int = 22050,
     hop_length: int = 512,
     min_gap_s: float = 20.0,
+    analysis_window_s: float = 90.0,
+    use_middle_crop: bool = True,
 ) -> List[Tuple[float, float]]:
     """
     Analyze an audio file and return the `n_candidates` best start positions
@@ -111,12 +113,19 @@ def find_best_segments(
         List of (start_seconds, score) tuples, sorted best-first.
         Candidates are spaced at least `min_gap_s` apart to ensure variety.
     """
-    y, sr = librosa.load(audio_path, sr=sr, mono=True)
+    full_duration_s = float(librosa.get_duration(path=audio_path))
+    offset_s = 0.0
+    load_duration_s = None
+    if use_middle_crop and analysis_window_s > 0 and full_duration_s > analysis_window_s:
+        offset_s = max(0.0, (full_duration_s - analysis_window_s) * 0.5)
+        load_duration_s = analysis_window_s
+
+    y, sr = librosa.load(audio_path, sr=sr, mono=True, offset=offset_s, duration=load_duration_s)
     duration_s = len(y) / sr
 
     if clip_duration >= duration_s:
-        # Song is shorter than desired clip — just return start=0
-        return [(0.0, 1.0)]
+        # If analyzed window is too short, return absolute offset.
+        return [(float(offset_s), 1.0)]
 
     energy = _energy_curve(y, sr, hop_length)
     onset = _onset_density(y, sr, hop_length)
@@ -142,7 +151,7 @@ def find_best_segments(
         best_frame = int(np.argmax(temp_scores))
         if temp_scores[best_frame] == -np.inf:
             break
-        best_time = librosa.frames_to_time(best_frame, sr=sr, hop_length=hop_length)
+        best_time = librosa.frames_to_time(best_frame, sr=sr, hop_length=hop_length) + offset_s
         results.append((float(best_time), float(temp_scores[best_frame])))
 
         # Suppress nearby frames
@@ -156,9 +165,10 @@ def find_best_segments(
 def pick_best_aligned_segments(
     path_a: str,
     path_b: str,
-    clip_duration: float = 30.0,
+    clip_duration: float = 45.0,
     n_candidates: int = 5,
     sr: int = 22050,
+    analysis_window_s: float = 90.0,
 ) -> Tuple[float, float, float, float]:
     """
     Find start positions in both tracks that maximize combined energy.
@@ -167,8 +177,22 @@ def pick_best_aligned_segments(
     Returns:
         (start_a, score_a, start_b, score_b)
     """
-    cands_a = find_best_segments(path_a, clip_duration, n_candidates, sr)
-    cands_b = find_best_segments(path_b, clip_duration, n_candidates, sr)
+    cands_a = find_best_segments(
+        path_a,
+        clip_duration=clip_duration,
+        n_candidates=n_candidates,
+        sr=sr,
+        analysis_window_s=analysis_window_s,
+        use_middle_crop=True,
+    )
+    cands_b = find_best_segments(
+        path_b,
+        clip_duration=clip_duration,
+        n_candidates=n_candidates,
+        sr=sr,
+        analysis_window_s=analysis_window_s,
+        use_middle_crop=True,
+    )
 
     # Pick pair that maximizes combined score
     best_score = -1.0

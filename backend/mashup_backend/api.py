@@ -1,59 +1,35 @@
 """
 api.py
 
-FastAPI backend for the mashup pipeline.
-
-Endpoints:
-  POST /upload            — upload two audio files, get session_id back
-  POST /analyze/{sid}     — run compatibility analysis, return scores
-  POST /preview/{sid}     — render the mashup clip, return audio URL
-  GET  /audio/{sid}       — stream/download the rendered mashup WAV
-  GET  /download/{sid}    — download as MP3
-  DELETE /session/{sid}   — clean up session files
-
-Run:
-    uvicorn api:app --reload --port 8000
-
-Frontend calls:
-    1. POST /upload  with form-data files track_a, track_b  → {session_id}
-    2. POST /analyze/{session_id}                           → {compatibility, segments, ...}
-    3. POST /preview/{session_id} with optional JSON body   → {preview_url, ...}
-    4. GET  /audio/{session_id}                             → WAV stream
-    5. GET  /download/{session_id}                          → MP3 download
+FastAPI backend for the strict mashup pipeline.
 """
 
 from __future__ import annotations
 
+import json
+import logging
 import os
 import shutil
 import uuid
-import logging
 from pathlib import Path
 from typing import Any, Dict, Optional
-
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s"
-)
-logger = logging.getLogger(__name__)
 
 from fastapi import FastAPI, File, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel
 
-from analyze_track import analyze_mp3, as_json_dict
+from analyze_track import analyze_mp3, as_json_dict, from_json_dict
 from compatibility import compare_tracks
-from segment_finder import pick_best_aligned_segments, find_best_segments
-from mashup_engine import MashupEngine, MashupConfig
+from mashup_engine import MashupConfig, MashupEngine
 
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+)
+logger = logging.getLogger(__name__)
 
-# ---------------------------------------------------------------------------
-# App setup
-# ---------------------------------------------------------------------------
-
-app = FastAPI(title="Mashup API", version="2.0")
-
+app = FastAPI(title="Mashup API", version="3.0")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -70,36 +46,30 @@ SESSIONS_DIR.mkdir(parents=True, exist_ok=True)
 @app.exception_handler(Exception)
 async def unhandled_exception_handler(_: Request, exc: Exception):
     logger.exception("Unhandled API exception:")
-    # Keep backend errors visible to frontend during development.
     return JSONResponse(status_code=500, content={"detail": str(exc)})
 
 
-# ---------------------------------------------------------------------------
-# Pydantic models
-# ---------------------------------------------------------------------------
-
 class PreviewRequest(BaseModel):
-    clip_duration: float = 45.0
+    clip_duration: float = 22.0
     start_a: Optional[float] = None
     start_b: Optional[float] = None
-    mashup_mode: str = "auto"           # auto | full_blend | vocals_a_inst_b | inst_a_vocals_b
-    use_stem_separation: bool = False
-    gain_db_a: float = -1.0
-    gain_db_b: Optional[float] = None
+    mashup_mode: str = "auto"  # auto | inst_a_vocals_b | vocals_a_inst_b
+    use_stem_separation: bool = True
+    gain_db_a: float = -7.0
+    gain_db_b: Optional[float] = -5.0
+
 
 class FeedbackRequest(BaseModel):
     rating: int
     comments: Optional[str] = None
 
 
-# ---------------------------------------------------------------------------
-# Session helpers
-# ---------------------------------------------------------------------------
 
 def session_dir(sid: str) -> Path:
     d = SESSIONS_DIR / sid
     d.mkdir(parents=True, exist_ok=True)
     return d
+
 
 
 def require_session(sid: str) -> Path:
@@ -109,18 +79,11 @@ def require_session(sid: str) -> Path:
     return d
 
 
-def session_file(sid: str, name: str) -> Path:
-    return require_session(sid) / name
-
 
 def save_upload(upload: UploadFile, dest: Path) -> None:
     with open(dest, "wb") as f:
         shutil.copyfileobj(upload.file, f)
 
-
-# ---------------------------------------------------------------------------
-# Routes
-# ---------------------------------------------------------------------------
 
 @app.post("/upload")
 @app.post("/api/upload")
@@ -128,10 +91,6 @@ async def upload_tracks(
     track_a: UploadFile = File(..., description="First track (MP3/WAV)"),
     track_b: UploadFile = File(..., description="Second track (MP3/WAV)"),
 ) -> Dict[str, Any]:
-    """
-    Upload two audio tracks and create a session.
-    Returns a session_id used by all subsequent calls.
-    """
     sid = str(uuid.uuid4())
     sdir = session_dir(sid)
 
@@ -140,11 +99,9 @@ async def upload_tracks(
 
     path_a = sdir / f"track_a{ext_a}"
     path_b = sdir / f"track_b{ext_b}"
-
     save_upload(track_a, path_a)
     save_upload(track_b, path_b)
 
-    # Save metadata
     meta = {
         "session_id": sid,
         "track_a": str(path_a),
@@ -152,7 +109,6 @@ async def upload_tracks(
         "track_a_name": track_a.filename,
         "track_b_name": track_b.filename,
     }
-    import json
     (sdir / "meta.json").write_text(json.dumps(meta, indent=2))
 
     return {
@@ -166,57 +122,51 @@ async def upload_tracks(
 @app.post("/analyze/{session_id}")
 @app.post("/api/analyze/{session_id}")
 async def analyze_session(session_id: str) -> Dict[str, Any]:
-    """
-    Run full analysis on both uploaded tracks:
-      - BPM, key, energy, timbre extraction
-      - Compatibility scoring with grade and summary
-      - Top candidate clip segments for each track
-    """
-    import json
     sdir = require_session(session_id)
     meta = json.loads((sdir / "meta.json").read_text())
-
     path_a = meta["track_a"]
     path_b = meta["track_b"]
 
     try:
-        feats_a = analyze_mp3(path_a)
-        feats_b = analyze_mp3(path_b)
-        comp = compare_tracks(feats_a, feats_b)
+        feats_a = analyze_mp3(
+            path_a,
+            target_sr=16000,
+            analysis_window_s=60.0,
+            use_middle_window=True,
+            fast_mode=True,
+        )
+        feats_b = analyze_mp3(
+            path_b,
+            target_sr=16000,
+            analysis_window_s=60.0,
+            use_middle_window=True,
+            fast_mode=True,
+        )
+        comp_ab = compare_tracks(feats_a, feats_b)
+        comp_ba = compare_tracks(feats_b, feats_a)
+        cands_a = [(0.0, 1.0)]
+        cands_b = [(0.0, 1.0)]
+    except Exception as exc:
+        logger.exception("Error during analysis for session %s", session_id)
+        raise HTTPException(status_code=500, detail=f"Analysis failed: {exc}")
 
-        # Find top 3 candidate start times for each track
-        cands_a = find_best_segments(path_a, clip_duration=45.0, n_candidates=3)
-        cands_b = find_best_segments(path_b, clip_duration=45.0, n_candidates=3)
-    except Exception as e:
-        logger.exception(f"Error during analysis for session {session_id}")
-        raise HTTPException(status_code=500, detail=f"Analysis failed: {str(e)}")
-
-    def score_value(name: str, default: float = 0.0) -> float:
-        value = getattr(comp, name, default)
-        try:
-            return round(float(value), 3)
-        except (TypeError, ValueError):
-            return round(float(default), 3)
-
-    spectral_score = score_value("spectral_contrast_score")
-    timbre_score = score_value("timbre_score", spectral_score)
-
-    result = {
-        "session_id": session_id,
-        "compatibility": {
+    def pack_comp(comp):
+        return {
             "score": round(comp.compatibility_score, 1),
             "grade": comp.grade,
+            "layerable": comp.layerable,
             "summary": comp.summary,
             "mashup_type": comp.mashup_type,
+            "reject_reasons": comp.reject_reasons,
             "details": {
-                "tempo_score": score_value("tempo_score"),
-                "key_score": score_value("key_score"),
-                "energy_score": score_value("energy_score"),
-                "loudness_score": score_value("loudness_score"),
-                "timbre_score": timbre_score,
-                "spectral_contrast_score": spectral_score,
-                "tonnetz_score": score_value("tonnetz_score"),
-                "danceability_match_score": score_value("danceability_match_score"),
+                "tempo_score": round(comp.tempo_score, 3),
+                "key_score": round(comp.key_score, 3),
+                "energy_score": round(comp.energy_score, 3),
+                "loudness_score": round(comp.loudness_score, 3),
+                "timbre_score": round(comp.timbre_score, 3),
+                "spectral_contrast_score": round(comp.spectral_contrast_score, 3),
+                "tonnetz_score": round(comp.tonnetz_score, 3),
+                "danceability_match_score": round(comp.danceability_match_score, 3),
             },
             "adjustments": {
                 "stretch_factor_b": round(comp.stretch_factor_b, 4),
@@ -224,82 +174,96 @@ async def analyze_session(session_id: str) -> Dict[str, Any]:
                 "pitch_shift_b_semitones": comp.pitch_shift_b,
                 "gain_db_b": round(comp.gain_db_b, 2),
             },
+        }
+
+    result = {
+        "session_id": session_id,
+        "compatibility": {
+            "inst_a_vocals_b": pack_comp(comp_ab),
+            "vocals_a_inst_b": pack_comp(comp_ba),
         },
         "track_a": {
             "name": meta.get("track_a_name", "track_a"),
             "features": as_json_dict(feats_a),
             "candidate_segments": [
-                {"start_s": round(t, 2), "quality_score": round(s, 3)}
-                for t, s in cands_a
+                {"start_s": round(t, 2), "quality_score": round(s, 3)} for t, s in cands_a
             ],
         },
         "track_b": {
             "name": meta.get("track_b_name", "track_b"),
             "features": as_json_dict(feats_b),
             "candidate_segments": [
-                {"start_s": round(t, 2), "quality_score": round(s, 3)}
-                for t, s in cands_b
+                {"start_s": round(t, 2), "quality_score": round(s, 3)} for t, s in cands_b
             ],
         },
     }
 
-    # Cache analysis
+    # Persist per-track fast artifacts so preview can reuse them.
+    (sdir / "track_a_analysis.json").write_text(json.dumps(as_json_dict(feats_a), indent=2))
+    (sdir / "track_b_analysis.json").write_text(json.dumps(as_json_dict(feats_b), indent=2))
+    (sdir / "track_a_candidates.json").write_text(json.dumps(cands_a, indent=2))
+    (sdir / "track_b_candidates.json").write_text(json.dumps(cands_b, indent=2))
     (sdir / "analysis.json").write_text(json.dumps(result, indent=2))
-
     return result
 
 
 @app.post("/preview/{session_id}")
 @app.post("/api/preview/{session_id}")
-async def render_preview(
-    session_id: str,
-    req: PreviewRequest = PreviewRequest(),
-) -> Dict[str, Any]:
-    """
-    Render a mashup preview clip using the analyzed parameters.
-    Optionally override start times and blend mode.
-
-    Returns preview metadata and audio URLs.
-    """
-    import json
+async def render_preview(session_id: str, req: PreviewRequest = PreviewRequest()) -> Dict[str, Any]:
     sdir = require_session(session_id)
     meta = json.loads((sdir / "meta.json").read_text())
 
     wav_out = str(sdir / "preview.wav")
-    # MP3 export needs ffmpeg. If not available, we still render WAV successfully.
     mp3_out = str(sdir / "preview.mp3") if shutil.which("ffmpeg") else None
 
-    logger.info(f"Rendering preview for session {session_id}. Mode: {req.mashup_mode}, Stems: {req.use_stem_separation}")
+    forced_mode = req.mashup_mode if req.mashup_mode in {"auto", "inst_a_vocals_b", "vocals_a_inst_b"} else "auto"
+    clip_duration = float(max(18.0, min(24.0, req.clip_duration)))
+
+    # Reuse cached analysis/candidate artifacts if present.
+    feats_a = None
+    feats_b = None
+    seg_score_a = None
+    seg_score_b = None
+    start_a = req.start_a
+    start_b = req.start_b
+    try:
+        a_analysis = sdir / "track_a_analysis.json"
+        b_analysis = sdir / "track_b_analysis.json"
+        if a_analysis.exists() and b_analysis.exists():
+            feats_a = from_json_dict(json.loads(a_analysis.read_text()))
+            feats_b = from_json_dict(json.loads(b_analysis.read_text()))
+    except Exception:
+        logger.warning("Could not load cached analysis artifacts for session %s; falling back to on-demand.", session_id)
+
+    if seg_score_a is None:
+        seg_score_a = 1.0
+    if seg_score_b is None:
+        seg_score_b = 1.0
 
     config = MashupConfig(
         track_a=meta["track_a"],
         track_b=meta["track_b"],
-        clip_duration=req.clip_duration,
-        start_a=req.start_a,
-        start_b=req.start_b,
-        mashup_mode=req.mashup_mode,
-        use_stem_separation=req.use_stem_separation,
+        clip_duration=clip_duration,
+        start_a=start_a,
+        start_b=start_b,
+        mashup_mode=forced_mode,
+        use_stem_separation=True,
         gain_db_a=req.gain_db_a,
         gain_db_b=req.gain_db_b,
         wav_out=wav_out,
         mp3_out=mp3_out,
         stems_dir=str(sdir / "stems"),
+        track_a_features=feats_a,
+        track_b_features=feats_b,
+        segment_score_a=seg_score_a,
+        segment_score_b=seg_score_b,
     )
 
-    # CRITICAL: If the user didn't explicitly turn off stems, and it's a lyrical pair, 
-    # we should default to stems to ensure we don't just overlay original tracks.
-    if req.use_stem_separation is None:
-        config.use_stem_separation = True
-
-    engine = MashupEngine()
-    try:
-        result = engine.run(config)
-    except Exception as e:
-        logger.exception(f"Error rendering preview for session {session_id}")
-        raise HTTPException(status_code=500, detail=f"Rendering failed: {str(e)}")
-
+    result = MashupEngine().run(config)
     if not result.success:
-        raise HTTPException(status_code=500, detail=result.error)
+        detail = result.error or result.summary or "Rendering failed"
+        status = 422 if "Mashup rejected:" in detail else 500
+        raise HTTPException(status_code=status, detail=detail)
 
     return {
         "session_id": session_id,
@@ -309,13 +273,15 @@ async def render_preview(
         "clip": {
             "start_a_s": round(result.start_a, 2),
             "start_b_s": round(result.start_b, 2),
-            "duration_s": req.clip_duration,
+            "duration_s": clip_duration,
             "segment_quality_a": round(result.segment_score_a, 3),
             "segment_quality_b": round(result.segment_score_b, 3),
         },
         "compatibility": {
             "score": round(result.compatibility.compatibility_score, 1),
             "grade": result.compatibility.grade,
+            "layerable": result.compatibility.layerable,
+            "reject_reasons": result.compatibility.reject_reasons,
         },
         "audio_url": f"/api/audio/{session_id}",
         "download_url": f"/api/download/{session_id}",
@@ -325,69 +291,29 @@ async def render_preview(
 @app.get("/audio/{session_id}")
 @app.get("/api/audio/{session_id}")
 async def stream_audio(session_id: str):
-    """Stream the rendered preview WAV for in-browser playback."""
     sdir = require_session(session_id)
     wav = sdir / "preview.wav"
     if not wav.exists():
-        raise HTTPException(status_code=404, detail="Preview not rendered yet. Call POST /preview first.")
+        raise HTTPException(status_code=404, detail="Preview audio not found.")
     return FileResponse(str(wav), media_type="audio/wav", filename="mashup_preview.wav")
 
 
 @app.get("/download/{session_id}")
 @app.get("/api/download/{session_id}")
-async def download_mp3(session_id: str):
-    """Download the rendered preview as MP3."""
+async def download_audio(session_id: str):
     sdir = require_session(session_id)
     mp3 = sdir / "preview.mp3"
-    if not mp3.exists():
-        # Fall back to WAV
-        wav = sdir / "preview.wav"
-        if not wav.exists():
-            raise HTTPException(status_code=404, detail="Preview not rendered yet. Call POST /preview first.")
+    wav = sdir / "preview.wav"
+    if mp3.exists():
+        return FileResponse(str(mp3), media_type="audio/mpeg", filename="mashup_preview.mp3")
+    if wav.exists():
         return FileResponse(str(wav), media_type="audio/wav", filename="mashup_preview.wav")
-    return FileResponse(str(mp3), media_type="audio/mpeg", filename="mashup_preview.mp3")
+    raise HTTPException(status_code=404, detail="Rendered audio not found.")
 
 
 @app.delete("/session/{session_id}")
 @app.delete("/api/session/{session_id}")
-async def delete_session(session_id: str):
-    """Remove all files associated with a session."""
-    sdir = SESSIONS_DIR / session_id
-    if sdir.exists():
-        shutil.rmtree(sdir)
-    return {"session_id": session_id, "deleted": True}
-
-
-@app.post("/feedback/{session_id}")
-@app.post("/api/feedback/{session_id}")
-async def submit_feedback(session_id: str, req: FeedbackRequest):
-    """Save user feedback (rating 1-5) for a rendered mashup session."""
-    import json
+async def delete_session(session_id: str) -> Dict[str, Any]:
     sdir = require_session(session_id)
-    feedback_file = sdir / "feedback.json"
-    
-    data = {
-        "rating": req.rating,
-        "comments": req.comments,
-    }
-    
-    try:
-        feedback_file.write_text(json.dumps(data, indent=2))
-        logger.info(f"Saved feedback for session {session_id}: rating={req.rating}")
-        
-        # Optionally, append to a global CSV for training
-        global_csv = SESSIONS_DIR / "all_feedback.csv"
-        csv_line = f"{session_id},{req.rating},{req.comments or ''}\n"
-        with open(global_csv, "a", encoding="utf-8") as f:
-            f.write(csv_line)
-            
-        return {"session_id": session_id, "message": "Feedback saved successfully"}
-    except Exception as e:
-        logger.exception(f"Failed to save feedback for session {session_id}")
-        raise HTTPException(status_code=500, detail="Failed to save feedback.")
-
-
-@app.get("/health")
-@app.get("/api/health")
-async def health():
-    return {"status": "ok", "version": "2.0"}
+    shutil.rmtree(sdir, ignore_errors=True)
+    return {"session_id": session_id, "deleted": True}

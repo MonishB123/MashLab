@@ -33,3 +33,8 @@ dist-ssr
 backend/mashup_backend/.sessions/
 backend/**/__pycache__/
 backend/**/*.pyc
+backend/.venv/
+backend/.venv*/
+backend/venv/
+backend/stem_exports/
+backend/.tmp_quickcheck/
