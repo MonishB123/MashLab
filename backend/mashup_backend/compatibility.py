@@ -137,6 +137,8 @@ def compare_tracks(track_a: TrackFeatures, track_b: TrackFeatures) -> Compatibil
     final_score = BASELINE_BIAS + (100.0 - BASELINE_BIAS) * (0.45 * key_score + 0.35 * signature_score + 0.20 * freq_score)
 
     reject_reasons: List[str] = []
+    if key_score < 0.85:
+        reject_reasons.append("key mismatch: different keys may clash when layered")
     if abs(stretch_pct_b) > MAX_STRETCH_PCT:
         reject_reasons.append(
             f"signature/tempo scaling too large ({stretch_pct_b:+.1f}% needed, max ±{MAX_STRETCH_PCT:.1f}%)"

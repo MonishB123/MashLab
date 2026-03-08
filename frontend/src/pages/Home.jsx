@@ -125,7 +125,7 @@ export default function Home() {
               <div className="grid grid-cols-1 sm:grid-cols-2 gap-10">
                 <div className="flex flex-col gap-4">
                   <div className="flex flex-col gap-2">
-                    <label className="font-mono text-sm uppercase tracking-wider text-muted-foreground">Track A Name (Spotify)</label>
+                    <label className="font-mono text-sm uppercase tracking-wider text-muted-foreground">Track A Name</label>
                     <input 
                       type="text" 
                       value={song1Name}
@@ -145,7 +145,7 @@ export default function Home() {
                 
                 <div className="flex flex-col gap-4">
                   <div className="flex flex-col gap-2">
-                    <label className="font-mono text-sm uppercase tracking-wider text-muted-foreground">Track B Name (Spotify)</label>
+                    <label className="font-mono text-sm uppercase tracking-wider text-muted-foreground">Track B Name</label>
                     <input 
                       type="text" 
                       value={song2Name}

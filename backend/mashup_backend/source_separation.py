@@ -184,15 +184,15 @@ def _fast_fallback_split(audio_path: str, sr: int) -> StemBundle:
 
 def _demucs_stack_ok() -> bool:
     """
-    Fast preflight for environments where Demucs fails at save time
-    because torchaudio runtime libraries are missing.
+    Fast preflight: only check that demucs itself is importable.
+    We use soundfile (not torchaudio) for saving stems, so torchaudio
+    is not required at runtime.
     """
     global _DEMUCS_STACK_OK
     if _DEMUCS_STACK_OK is not None:
         return _DEMUCS_STACK_OK
     try:
         import demucs  # noqa: F401
-        import torchaudio  # noqa: F401
         _DEMUCS_STACK_OK = True
     except Exception:
         _DEMUCS_STACK_OK = False

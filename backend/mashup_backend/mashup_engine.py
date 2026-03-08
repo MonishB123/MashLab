@@ -199,49 +199,51 @@ def _window_onset_corr(a: np.ndarray, b: np.ndarray, max_lag_frames: int) -> flo
 
 
 def _pick_short_sync_window(
-    path_a: str,
-    path_b: str,
+    path_inst: str,
+    path_vocal: str,
     clip_duration: float,
     analysis_sr: int = 12000,
 ) -> Tuple[float, float, float, float, float, float]:
     """
-    Pick short windows where local tempo is close, onset pulses align,
-    AND energy is high (prefer chorus / drop regions over quiet intros).
+    Direction-aware segment selection.
 
-    Returns: (start_a_s, start_b_s, local_tempo_a, local_tempo_b,
-              energy_score_a, energy_score_b)
+    - path_inst: the track providing the instrumental (wants HIGH energy — chorus/drop)
+    - path_vocal: the track providing the vocals (wants MODERATE energy — verse/pre-chorus
+      where vocals are prominent but the backing is sparser for cleaner separation)
+
+    Returns: (start_inst_s, start_vocal_s, local_tempo_inst, local_tempo_vocal,
+              energy_score_inst, energy_score_vocal)
     """
-    y_a, _ = load_audio(path_a, sr=analysis_sr)
-    y_b, _ = load_audio(path_b, sr=analysis_sr)
+    y_inst, _ = load_audio(path_inst, sr=analysis_sr)
+    y_vocal, _ = load_audio(path_vocal, sr=analysis_sr)
 
     hop = 512
-    env_a = librosa.onset.onset_strength(y=y_a, sr=analysis_sr, hop_length=hop).astype(np.float32)
-    env_b = librosa.onset.onset_strength(y=y_b, sr=analysis_sr, hop_length=hop).astype(np.float32)
-    tempo_curve_a = np.ravel(
-        librosa.feature.tempo(onset_envelope=env_a, sr=analysis_sr, hop_length=hop, aggregate=None)
+    env_inst = librosa.onset.onset_strength(y=y_inst, sr=analysis_sr, hop_length=hop).astype(np.float32)
+    env_vocal = librosa.onset.onset_strength(y=y_vocal, sr=analysis_sr, hop_length=hop).astype(np.float32)
+    tempo_curve_inst = np.ravel(
+        librosa.feature.tempo(onset_envelope=env_inst, sr=analysis_sr, hop_length=hop, aggregate=None)
     )
-    tempo_curve_b = np.ravel(
-        librosa.feature.tempo(onset_envelope=env_b, sr=analysis_sr, hop_length=hop, aggregate=None)
+    tempo_curve_vocal = np.ravel(
+        librosa.feature.tempo(onset_envelope=env_vocal, sr=analysis_sr, hop_length=hop, aggregate=None)
     )
 
-    # Compute per-frame RMS energy for energy-aware selection
-    rms_a = librosa.feature.rms(y=y_a, hop_length=hop)[0]
-    rms_b = librosa.feature.rms(y=y_b, hop_length=hop)[0]
-    rms_a = rms_a / (np.max(rms_a) + 1e-9)
-    rms_b = rms_b / (np.max(rms_b) + 1e-9)
+    rms_inst = librosa.feature.rms(y=y_inst, hop_length=hop)[0]
+    rms_vocal = librosa.feature.rms(y=y_vocal, hop_length=hop)[0]
+    rms_inst = rms_inst / (np.max(rms_inst) + 1e-9)
+    rms_vocal = rms_vocal / (np.max(rms_vocal) + 1e-9)
 
     frames_clip = max(8, int(clip_duration * analysis_sr / hop))
     step_frames = max(1, int(4.0 * analysis_sr / hop))
 
     # Skip first/last 10% of each track to avoid intros/outros
-    total_frames_a = len(env_a)
-    total_frames_b = len(env_b)
-    skip_a = int(total_frames_a * 0.10)
-    skip_b = int(total_frames_b * 0.10)
-    max_start_a = max(0, total_frames_a - frames_clip - skip_a)
-    max_start_b = max(0, total_frames_b - frames_clip - skip_b)
-    starts_a = list(range(skip_a, max_start_a + 1, step_frames)) or [0]
-    starts_b = list(range(skip_b, max_start_b + 1, step_frames)) or [0]
+    total_frames_inst = len(env_inst)
+    total_frames_vocal = len(env_vocal)
+    skip_inst = int(total_frames_inst * 0.10)
+    skip_vocal = int(total_frames_vocal * 0.10)
+    max_start_inst = max(0, total_frames_inst - frames_clip - skip_inst)
+    max_start_vocal = max(0, total_frames_vocal - frames_clip - skip_vocal)
+    starts_inst = list(range(skip_inst, max_start_inst + 1, step_frames)) or [0]
+    starts_vocal = list(range(skip_vocal, max_start_vocal + 1, step_frames)) or [0]
 
     def _local_tempo(curve: np.ndarray, i0: int, i1: int, fallback: float) -> float:
         w = curve[i0:i1]
@@ -254,52 +256,65 @@ def _pick_short_sync_window(
         w = rms[i0:min(i1, len(rms))]
         return float(np.mean(w)) if len(w) > 0 else 0.0
 
-    global_tempo_a = float(np.nanmedian(tempo_curve_a)) if len(tempo_curve_a) else 120.0
-    global_tempo_b = float(np.nanmedian(tempo_curve_b)) if len(tempo_curve_b) else 120.0
-    tempos_a = [_local_tempo(tempo_curve_a, s, s + frames_clip, global_tempo_a) for s in starts_a]
-    tempos_b = [_local_tempo(tempo_curve_b, s, s + frames_clip, global_tempo_b) for s in starts_b]
-    energies_a = [_window_energy(rms_a, s, s + frames_clip) for s in starts_a]
-    energies_b = [_window_energy(rms_b, s, s + frames_clip) for s in starts_b]
+    global_tempo_inst = float(np.nanmedian(tempo_curve_inst)) if len(tempo_curve_inst) else 120.0
+    global_tempo_vocal = float(np.nanmedian(tempo_curve_vocal)) if len(tempo_curve_vocal) else 120.0
+    tempos_inst = [_local_tempo(tempo_curve_inst, s, s + frames_clip, global_tempo_inst) for s in starts_inst]
+    tempos_vocal = [_local_tempo(tempo_curve_vocal, s, s + frames_clip, global_tempo_vocal) for s in starts_vocal]
+    energies_inst = [_window_energy(rms_inst, s, s + frames_clip) for s in starts_inst]
+    energies_vocal = [_window_energy(rms_vocal, s, s + frames_clip) for s in starts_vocal]
 
-    # Pre-filter: only keep windows with energy above 50% of max for that track.
-    # This eliminates quiet intros/verses from consideration entirely.
-    max_ea = max(energies_a) if energies_a else 1.0
-    max_eb = max(energies_b) if energies_b else 1.0
-    energy_threshold = 0.50
-    valid_a = [i for i, e in enumerate(energies_a) if e >= energy_threshold * max_ea]
-    valid_b = [i for i, e in enumerate(energies_b) if e >= energy_threshold * max_eb]
-    # Fall back to all windows if filtering is too aggressive
-    if not valid_a:
-        valid_a = list(range(len(starts_a)))
-    if not valid_b:
-        valid_b = list(range(len(starts_b)))
+    # Instrumental track: only keep high-energy windows (>50% of max).
+    max_e_inst = max(energies_inst) if energies_inst else 1.0
+    valid_inst = [i for i, e in enumerate(energies_inst) if e >= 0.50 * max_e_inst]
+    if not valid_inst:
+        valid_inst = list(range(len(starts_inst)))
+
+    # Vocal track: keep moderate-energy windows (30-80% of max).
+    # This avoids both dead quiet sections AND the loudest chorus where
+    # the dense instrumental backing makes separation harder and causes clash.
+    max_e_vocal = max(energies_vocal) if energies_vocal else 1.0
+    valid_vocal = [i for i, e in enumerate(energies_vocal)
+                   if 0.30 * max_e_vocal <= e <= 0.80 * max_e_vocal]
+    if not valid_vocal:
+        # Fall back: prefer anything above 25%
+        valid_vocal = [i for i, e in enumerate(energies_vocal) if e >= 0.25 * max_e_vocal]
+    if not valid_vocal:
+        valid_vocal = list(range(len(starts_vocal)))
 
     best_score = -1.0
-    best = (0.0, 0.0, global_tempo_a, global_tempo_b, 0.0, 0.0)
+    best = (0.0, 0.0, global_tempo_inst, global_tempo_vocal, 0.0, 0.0)
     lag_cap = int(1.5 * analysis_sr / hop)
-    tempos_b_arr = np.array([tempos_b[j] for j in valid_b], dtype=np.float32)
-    valid_b_arr = np.array(valid_b)
+    tempos_vocal_arr = np.array([tempos_vocal[j] for j in valid_vocal], dtype=np.float32)
+    valid_vocal_arr = np.array(valid_vocal)
 
-    for i in valid_a:
-        sa = starts_a[i]
-        ta = max(1e-6, float(tempos_a[i]))
-        ea = float(energies_a[i])
-        tempo_diffs = np.abs(tempos_b_arr - ta) / ta
-        top_b_indices = np.argsort(tempo_diffs)[: min(8, len(valid_b))]
-        win_a = env_a[sa : sa + frames_clip]
-        for bi in top_b_indices:
-            j = int(valid_b_arr[bi])
-            sb = starts_b[j]
-            tb = max(1e-6, float(tempos_b[j]))
-            eb = float(energies_b[j])
+    for i in valid_inst:
+        sa = starts_inst[i]
+        ta = max(1e-6, float(tempos_inst[i]))
+        ea = float(energies_inst[i])
+        tempo_diffs = np.abs(tempos_vocal_arr - ta) / ta
+        top_vocal_indices = np.argsort(tempo_diffs)[: min(8, len(valid_vocal))]
+        win_inst = env_inst[sa : sa + frames_clip]
+        for bi in top_vocal_indices:
+            j = int(valid_vocal_arr[bi])
+            sb = starts_vocal[j]
+            tb = max(1e-6, float(tempos_vocal[j]))
+            eb = float(energies_vocal[j])
             tempo_score = float(max(0.0, 1.0 - min(1.0, abs(tb - ta) / ta)))
-            beat_score = _window_onset_corr(win_a, env_b[sb : sb + frames_clip], lag_cap)
-            energy_score = (ea + eb) / 2.0
+            beat_score = _window_onset_corr(win_inst, env_vocal[sb : sb + frames_clip], lag_cap)
 
-            # Energy-first scoring: energy 50%, tempo 30%, beat sync 20%
-            # Energy is dominant to ensure we land on choruses/drops.
-            # Tempo and beat sync keep things musically compatible.
-            combined = 0.50 * energy_score + 0.30 * tempo_score + 0.20 * beat_score
+            # Vocal energy preference: peaks around 0.55 of max, drops off
+            # at extremes. This favors verse/pre-chorus sections where vocals
+            # are clear but the instrumental backing is sparser.
+            vocal_energy_pref = max(0.0, 1.0 - abs(eb - 0.55) / 0.45)
+
+            # Instrumental: raw energy (higher = better, lands on chorus/drop)
+            # Vocal: moderate energy preference (cleaner separation)
+            # Tempo: must match closely
+            # Beat sync: rhythmic compatibility
+            combined = (0.30 * ea
+                        + 0.20 * vocal_energy_pref
+                        + 0.30 * tempo_score
+                        + 0.20 * beat_score)
             if combined > best_score:
                 best_score = combined
                 best = (
@@ -311,39 +326,27 @@ def _pick_short_sync_window(
                     eb,
                 )
 
-    # --- Energy peak centering ---
-    # Shift starts so the RMS energy peak lands ~35-40% into the clip
-    # (i.e. roughly 15-20s into a 45s clip) instead of near the end.
-    target_peak_frac = 0.37  # where we want the peak (37% into clip)
-    late_threshold = 0.60    # consider it "late" if peak is past 60%
+    # --- Energy peak centering (instrumental only) ---
+    # Shift instrumental start so the RMS energy peak lands ~35-40% into the clip.
+    target_peak_frac = 0.37
+    late_threshold = 0.60
 
-    best_start_a_s, best_start_b_s, bta, btb, bea, beb = best
+    best_start_inst_s, best_start_vocal_s, bta, btb, bea, beb = best
 
-    for track_label, rms_curve, start_s, total_dur_s in [
-        ("a", rms_a, best_start_a_s, len(y_a) / analysis_sr),
-        ("b", rms_b, best_start_b_s, len(y_b) / analysis_sr),
-    ]:
-        start_frame = int(start_s * analysis_sr / hop)
-        end_frame = start_frame + frames_clip
-        rms_window = rms_curve[start_frame : min(end_frame, len(rms_curve))]
-        if len(rms_window) < 4:
-            continue
+    start_frame = int(best_start_inst_s * analysis_sr / hop)
+    end_frame = start_frame + frames_clip
+    rms_window = rms_inst[start_frame : min(end_frame, len(rms_inst))]
+    if len(rms_window) >= 4:
         peak_pos = int(np.argmax(rms_window))
         peak_frac = peak_pos / len(rms_window)
         if peak_frac > late_threshold:
-            # Peak is in the last portion — shift start forward so peak
-            # lands at target_peak_frac of the window.
             shift_frames = int((peak_frac - target_peak_frac) * len(rms_window))
             new_start_frame = start_frame + shift_frames
-            max_start_frame = int(total_dur_s * analysis_sr / hop) - frames_clip
+            max_start_frame = int(len(y_inst) / analysis_sr * analysis_sr / hop) - frames_clip
             new_start_frame = max(0, min(new_start_frame, max(0, max_start_frame)))
-            new_start_s = float(new_start_frame * hop / analysis_sr)
-            if track_label == "a":
-                best_start_a_s = new_start_s
-            else:
-                best_start_b_s = new_start_s
+            best_start_inst_s = float(new_start_frame * hop / analysis_sr)
 
-    best = (best_start_a_s, best_start_b_s, bta, btb, bea, beb)
+    best = (best_start_inst_s, best_start_vocal_s, bta, btb, bea, beb)
     return best
 
 
@@ -395,14 +398,32 @@ def _match_rms_to_target(y: np.ndarray, target_rms: float) -> np.ndarray:
 
 
 def _mix_equal_db(instrumental: np.ndarray, vocal: np.ndarray) -> np.ndarray:
+    """
+    Mix vocal over instrumental at equal loudness.
+
+    Uses the vocal's active (non-silent) RMS instead of overall RMS so that
+    natural gaps between vocal phrases don't drag down the measured level.
+    Both signals are matched to equal RMS, then normalized.
+    """
     target_len = max(len(instrumental), len(vocal))
     inst = pad_or_trim_to_length(instrumental, target_len)
     voc = pad_or_trim_to_length(vocal, target_len)
-    target_rms = 0.5 * (
-        float(np.sqrt(np.mean(np.square(inst))) + 1e-9) + float(np.sqrt(np.mean(np.square(voc))) + 1e-9)
-    )
-    inst = _match_rms_to_target(inst, target_rms)
-    voc = _match_rms_to_target(voc, target_rms)
+
+    inst_rms = float(np.sqrt(np.mean(np.square(inst))) + 1e-9)
+
+    # Compute vocal RMS from non-silent portions only (above -35dB of peak).
+    voc_peak = float(np.max(np.abs(voc)) + 1e-9)
+    silence_thresh = voc_peak * 0.018  # ~-35dB below peak
+    active_mask = np.abs(voc) > silence_thresh
+    if np.sum(active_mask) > 0:
+        voc_active_rms = float(np.sqrt(np.mean(np.square(voc[active_mask]))) + 1e-9)
+    else:
+        voc_active_rms = float(np.sqrt(np.mean(np.square(voc))) + 1e-9)
+
+    # Match vocal's active RMS to instrumental RMS (equal loudness).
+    voc_gain = inst_rms / voc_active_rms
+    voc = (voc * voc_gain).astype(np.float32)
+
     mixed = inst + voc
     return normalize_peak(mixed, peak=0.92)
 
@@ -578,6 +599,16 @@ def _align_vocal_to_master(
 
 
 
+def _compute_pitch_shift(inst_key_pc: int, inst_mode: int,
+                         vocal_key_pc: int, vocal_mode: int) -> int:
+    """
+    Pitch shifting is disabled. Key detection (Krumhansl-Schmuckler) is too
+    unreliable for automatic correction — wrong shifts sound far worse than
+    a natural key mismatch, especially on high-pitched vocals.
+    """
+    return 0
+
+
 def _render_with_stems(
     path_a: str,
     path_b: str,
@@ -588,6 +619,7 @@ def _render_with_stems(
     sr: int,
     stems_dir: Optional[str],
     config: MashupConfig,
+    pitch_shift_semitones: int = 0,
 ) -> Tuple[np.ndarray, float, np.ndarray, np.ndarray]:
     tmpdir = stems_dir or tempfile.mkdtemp(prefix="mashup_stems_")
     os.makedirs(tmpdir, exist_ok=True)
@@ -616,6 +648,12 @@ def _render_with_stems(
         rhythm_reference = clip_b_raw
         vocal = vocals_b
 
+    # Pitch-shift vocal to match the instrumental's key.
+    if pitch_shift_semitones != 0:
+        vocal = librosa.effects.pitch_shift(
+            vocal, sr=sr, n_steps=float(pitch_shift_semitones),
+        ).astype(np.float32)
+
     aligned_vocal, beat_sync_score = _align_vocal_to_master(
         instrumental_master=instrumental,
         rhythm_reference=rhythm_reference,
@@ -631,7 +669,8 @@ def _render_with_stems(
     mixed = _mix_equal_db(inst_eq, vocal_eq)
     # Return rhythm_reference (original full track of vocal side) for sync
     # analysis — separated vocal stems lack rhythmic onsets.
-    return mixed, beat_sync_score, instrumental, rhythm_reference
+    # Also return aligned_vocal so trim can prefer regions with vocal energy.
+    return mixed, beat_sync_score, instrumental, rhythm_reference, aligned_vocal
 
 
 def _trim_to_best_sync(
@@ -639,19 +678,20 @@ def _trim_to_best_sync(
     rhythm_ref: np.ndarray,
     mixed: np.ndarray,
     sr: int,
-    min_duration: float = 20.0,
+    aligned_vocal: Optional[np.ndarray] = None,
+    min_duration: float = 15.0,
     fade_in_s: float = 0.05,
     fade_out_s: float = 0.20,
 ) -> np.ndarray:
     """
     Scan the rendered audio for the best-synced sub-region and trim to it.
 
-    Uses onset envelopes of the instrumental and rhythm reference (original
-    full track of the vocal side — NOT the separated vocal, which lacks
-    rhythmic onsets) to find where beats lock best.
+    Scores each window by a combination of:
+    - Onset cross-correlation (beat sync)
+    - Vocal energy (prefer regions where vocals are actually present)
 
-    Slides small (5s) analysis windows across the clip, scores each by onset
-    cross-correlation, then finds the best contiguous region >= min_duration.
+    This prevents trimming to purely instrumental sections where the vocal
+    has dropped off.
     """
     total_s = len(mixed) / sr
     if total_s <= min_duration + 1.0:
@@ -665,25 +705,40 @@ def _trim_to_best_sync(
     if n_frames == 0:
         return mixed
 
-    # Use 5s analysis windows for fine-grained scoring, stepped every 1s
+    # Compute per-frame vocal energy if vocal stem is available.
+    vocal_rms = None
+    if aligned_vocal is not None and len(aligned_vocal) > 0:
+        voc_rms_raw = librosa.feature.rms(y=aligned_vocal, hop_length=hop)[0]
+        voc_max = float(np.max(voc_rms_raw)) + 1e-9
+        vocal_rms = voc_rms_raw / voc_max  # normalized 0-1
+
     analysis_win_s = 5.0
     win_frames = int(analysis_win_s * sr / hop)
     step_frames = max(1, int(1.0 * sr / hop))
-    max_lag = int(0.15 * sr / hop)  # 150ms tolerance
+    max_lag = int(0.15 * sr / hop)
 
     if win_frames >= n_frames:
         return mixed
 
-    # Score each 5s position
     positions = list(range(0, n_frames - win_frames + 1, step_frames))
     scores = []
     for pos in positions:
-        sc = _window_onset_corr(
+        sync_sc = _window_onset_corr(
             env_inst[pos : pos + win_frames],
             env_ref[pos : pos + win_frames],
             max_lag,
         )
-        scores.append(sc)
+        # Vocal energy score for this window (0-1).
+        voc_sc = 0.5  # neutral default if no vocal stem
+        if vocal_rms is not None:
+            voc_window = vocal_rms[pos : min(pos + win_frames, len(vocal_rms))]
+            if len(voc_window) > 0:
+                voc_sc = float(np.mean(voc_window))
+
+        # Combined: 50% sync + 50% vocal presence.
+        # This ensures we never trim to a region with no vocals.
+        combined = 0.50 * sync_sc + 0.50 * voc_sc
+        scores.append(combined)
 
     if not scores:
         return mixed
@@ -691,26 +746,21 @@ def _trim_to_best_sync(
     scores_arr = np.array(scores, dtype=np.float32)
     peak_score = float(np.max(scores_arr))
     if peak_score < 1e-6:
-        return mixed  # No meaningful correlation anywhere
+        return mixed
 
-    # Slide a min_duration-sized window over the per-second scores and
-    # pick the position with the highest average sync score.
-    min_windows = max(1, int(min_duration))  # ~1 window per second
+    min_windows = max(1, int(min_duration))
     if len(scores_arr) <= min_windows:
         return mixed
 
-    # Compute rolling average efficiently
     cumsum = np.cumsum(np.insert(scores_arr, 0, 0.0))
     rolling_avg = (cumsum[min_windows:] - cumsum[:-min_windows]) / min_windows
     best_run_start = int(np.argmax(rolling_avg))
     best_run_avg = float(rolling_avg[best_run_start])
     full_avg = float(np.mean(scores_arr))
 
-    # Only trim if the best region is meaningfully better than the full clip
-    if best_run_avg <= full_avg * 1.05:
-        return mixed  # Best region isn't much better, keep full clip
+    if best_run_avg <= full_avg * 1.02:
+        return mixed
 
-    # Convert back to samples
     start_sample = positions[best_run_start] * hop
     end_pos_idx = min(best_run_start + min_windows - 1, len(positions) - 1)
     end_sample = min(len(mixed), (positions[end_pos_idx] + win_frames) * hop)
@@ -719,7 +769,6 @@ def _trim_to_best_sync(
     if region_duration < min_duration:
         return mixed
 
-    # If trimmed region is nearly the full clip (>85%), skip trimming
     if region_duration >= total_s * 0.85:
         return mixed
 
@@ -796,20 +845,33 @@ class MashupEngine:
         comp_ab = compare_tracks(feats_a, feats_b)
         comp_ba = compare_tracks(feats_b, feats_a)
 
+        # Choose direction BEFORE segment selection so we can pick
+        # high-energy sections for the instrumental and moderate-energy
+        # (vocal-forward) sections for the vocal track.
+        decision = _choose_direction(comp_ab, comp_ba, config.mashup_mode)
+
         if config.start_a is not None and config.start_b is not None:
             start_a = float(config.start_a)
             start_b = float(config.start_b)
             seg_score_a = 1.0
             seg_score_b = 1.0
         else:
-            start_a, start_b, _, _, seg_score_a, seg_score_b = _pick_short_sync_window(
-                config.track_a,
-                config.track_b,
-                clip_duration=clip_duration,
-                analysis_sr=12000,
-            )
-
-        decision = _choose_direction(comp_ab, comp_ba, config.mashup_mode)
+            # Pass tracks in (instrumental, vocal) order for direction-aware selection.
+            if decision.mode == "inst_a_vocals_b":
+                s_inst, s_vocal, _, _, seg_inst, seg_vocal = _pick_short_sync_window(
+                    config.track_a, config.track_b,
+                    clip_duration=clip_duration, analysis_sr=12000,
+                )
+                start_a, start_b = s_inst, s_vocal
+                seg_score_a, seg_score_b = seg_inst, seg_vocal
+            else:
+                # vocals_a_inst_b: B is instrumental, A is vocal
+                s_inst, s_vocal, _, _, seg_inst, seg_vocal = _pick_short_sync_window(
+                    config.track_b, config.track_a,
+                    clip_duration=clip_duration, analysis_sr=12000,
+                )
+                start_b, start_a = s_inst, s_vocal
+                seg_score_b, seg_score_a = seg_inst, seg_vocal
         reject_reasons = list(decision.reject_reasons)
 
         if not config.use_stem_separation:
@@ -822,7 +884,21 @@ class MashupEngine:
         if reject_reasons:
             warnings.append("Ignored compatibility checks: " + "; ".join(reject_reasons))
 
-        mixed, beat_sync_score, stem_inst, stem_vocal = _render_with_stems(
+        # Compute pitch shift to align vocals to instrumental key.
+        if decision.mode == "vocals_a_inst_b":
+            # Instrumental from B, vocals from A → shift A vocals to B's key
+            pitch_shift = _compute_pitch_shift(
+                feats_b.key_pc_guess, feats_b.mode,
+                feats_a.key_pc_guess, feats_a.mode,
+            )
+        else:
+            # Instrumental from A, vocals from B → shift B vocals to A's key
+            pitch_shift = _compute_pitch_shift(
+                feats_a.key_pc_guess, feats_a.mode,
+                feats_b.key_pc_guess, feats_b.mode,
+            )
+
+        mixed, beat_sync_score, stem_inst, stem_vocal, stem_aligned_voc = _render_with_stems(
             config.track_a,
             config.track_b,
             mode=decision.mode,
@@ -832,12 +908,15 @@ class MashupEngine:
             sr=config.sr,
             stems_dir=config.stems_dir,
             config=config,
+            pitch_shift_semitones=pitch_shift,
         )
 
         # Trim to the best-synced region (removes misaligned edges).
+        # Pass aligned vocal so trim prefers regions with vocal presence.
         mixed = _trim_to_best_sync(
             stem_inst, stem_vocal, mixed, config.sr,
-            min_duration=20.0,
+            aligned_vocal=stem_aligned_voc,
+            min_duration=15.0,
             fade_in_s=config.fade_in_s,
             fade_out_s=config.fade_out_s,
         )
@@ -867,7 +946,7 @@ class MashupEngine:
         summary = (
             f"Accepted. Mode: {decision.mode}. "
             f"Sync: short-window tempo+onset match. "
-            f"Vocal tempo scale: +0.0% (disabled). "
+            f"Vocal pitch shift: {pitch_shift:+d} semitones. "
             f"Beat lock score: {beat_sync_score:.2f}. "
             f"Clip duration: {clip_duration:.1f}s."
         )
