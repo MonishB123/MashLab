@@ -210,10 +210,11 @@ export default function Home() {
                 <div className="flex-1 h-px bg-border" />
               </div>
 
-              <ResultCard 
-                result={result} 
-                song1Name={song1Name || song1?.name} 
-                song2Name={song2Name || song2?.name} 
+              <ResultCard
+                result={result}
+                song1Name={song1Name || song1?.name}
+                song2Name={song2Name || song2?.name}
+                sessionId={result.session_id}
               />
 
               <button

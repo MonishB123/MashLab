@@ -3,14 +3,16 @@ import { ThumbsUp, ThumbsDown, Check } from "lucide-react";
 import CompatibilityMeter from "./CompatibilityMeter";
 import MashupPlayer from "./MashupPlayer";
 import { cn } from "@/lib/utils";
+import { sendFeedback, getUserId } from "@/api/analyzeClient";
 
 // ── Backend integration point ──────────────────────────────────────────────
 const COMPATIBILITY_THRESHOLD = 60;
 // ──────────────────────────────────────────────────────────────────────────
 
-export default function ResultCard({ result, song1Name, song2Name }) {
+export default function ResultCard({ result, song1Name, song2Name, sessionId }) {
   const isCompatible = result.score >= COMPATIBILITY_THRESHOLD;
   const [rating, setRating] = useState(null); // 'up', 'down', or null
+  const [displayScore, setDisplayScore] = useState(result.score);
 
   return (
     <div className="w-full flex flex-col gap-10 animate-fade-up">
@@ -21,7 +23,7 @@ export default function ResultCard({ result, song1Name, song2Name }) {
         <span className="truncate max-w-[180px]">{song2Name?.replace(/\.[^/.]+$/, "") || "Track B"}</span>
       </div>
 
-      <CompatibilityMeter score={result.score} />
+      <CompatibilityMeter score={displayScore} />
 
       {result.preview?.summary && (
         <p className="font-mono text-xs text-muted-foreground bg-muted p-2 rounded border border-dashed">
@@ -40,7 +42,15 @@ export default function ResultCard({ result, song1Name, song2Name }) {
             <p className="font-display text-2xl uppercase tracking-widest">Rate this Mashup</p>
             <div className="flex gap-6">
               <button
-                onClick={() => setRating('up')}
+                onClick={async () => {
+                  setRating('up');
+                  if (sessionId) {
+                    try {
+                      const res = await sendFeedback(sessionId, 'up', getUserId());
+                      if (res.updated_score != null) setDisplayScore(res.updated_score);
+                    } catch (e) { console.error('Feedback error:', e); }
+                  }
+                }}
                 className={cn(
                   "w-20 h-20 border-3 border-foreground flex items-center justify-center transition-all",
                   rating === 'up' ? "bg-primary text-white scale-110 shadow-none translate-x-1 translate-y-1" : "bg-white hover:bg-primary/10 brutal-btn-shadow"
@@ -53,7 +63,15 @@ export default function ResultCard({ result, song1Name, song2Name }) {
               </button>
               
               <button
-                onClick={() => setRating('down')}
+                onClick={async () => {
+                  setRating('down');
+                  if (sessionId) {
+                    try {
+                      const res = await sendFeedback(sessionId, 'down', getUserId());
+                      if (res.updated_score != null) setDisplayScore(res.updated_score);
+                    } catch (e) { console.error('Feedback error:', e); }
+                  }
+                }}
                 className={cn(
                   "w-20 h-20 border-3 border-foreground flex items-center justify-center transition-all",
                   rating === 'down' ? "bg-foreground text-white scale-110 shadow-none translate-x-1 translate-y-1" : "bg-white hover:bg-foreground/10 brutal-btn-shadow"

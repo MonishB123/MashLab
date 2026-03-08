@@ -86,6 +86,29 @@ async function createPreview(sessionId) {
   return parseJson(response);
 }
 
+export function getUserId() {
+  let id = localStorage.getItem("mashlab_user_id");
+  if (!id) {
+    id = crypto.randomUUID();
+    localStorage.setItem("mashlab_user_id", id);
+  }
+  return id;
+}
+
+export async function sendFeedback(sessionId, rating, userId) {
+  const response = await request(`${API_BASE_URL}/api/feedback/${sessionId}`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ rating, user_id: userId }),
+  }, "Feedback");
+
+  if (!response.ok) {
+    throw new Error(await parseErrorMessage(response, "Feedback submission failed"));
+  }
+
+  return parseJson(response);
+}
+
 export async function analyzeSongs(song1, song2) {
   if (!song1 || !song2) {
     throw new Error("Both tracks are required");
@@ -101,7 +124,13 @@ export async function analyzeSongs(song1, song2) {
   const previewResult = await createPreview(sessionId);
 
   return {
-    score: Number(analysisResult?.compatibility?.score ?? 0),
+    score: Number(
+      previewResult?.compatibility?.score
+      ?? Math.max(
+        Number(analysisResult?.compatibility?.inst_a_vocals_b?.score ?? 0),
+        Number(analysisResult?.compatibility?.vocals_a_inst_b?.score ?? 0),
+      )
+    ),
     preview_url: toAbsoluteUrl(previewResult.audio_url),
     preview_song_name: `${stripExt(song1.name)} x ${stripExt(song2.name)}`,
     session_id: sessionId,

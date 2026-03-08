@@ -119,8 +119,8 @@ def compare_tracks(track_a: TrackFeatures, track_b: TrackFeatures) -> Compatibil
         key_score = 0.85
         key_relation = "relative major/minor"
     else:
-        key_score = 0.0
-        key_relation = "incompatible"
+        key_score = 0.3
+        key_relation = "different"
 
     # 2) Signature matching through simple tempo scaling.
     ratio_used, stretch_b, _ = best_tempo_alignment(track_a.tempo_bpm, track_b.tempo_bpm)
@@ -131,13 +131,12 @@ def compare_tracks(track_a: TrackFeatures, track_b: TrackFeatures) -> Compatibil
     c_a = max(1.0, float(track_a.spectral_centroid_hz))
     c_b = max(1.0, float(track_b.spectral_centroid_hz))
     freq_sep_oct = abs(np.log2(c_a / c_b))
-    freq_score = float(np.clip(freq_sep_oct / 1.0, 0.0, 1.0))
+    freq_score = float(np.clip(freq_sep_oct / 0.5, 0.0, 1.0))
 
-    final_score = 100.0 * (0.45 * key_score + 0.30 * signature_score + 0.25 * freq_score)
+    BASELINE_BIAS = 40.0
+    final_score = BASELINE_BIAS + (100.0 - BASELINE_BIAS) * (0.45 * key_score + 0.35 * signature_score + 0.20 * freq_score)
 
     reject_reasons: List[str] = []
-    if key_score <= 0.0:
-        reject_reasons.append("key mismatch: must be same key or relative major/minor")
     if abs(stretch_pct_b) > MAX_STRETCH_PCT:
         reject_reasons.append(
             f"signature/tempo scaling too large ({stretch_pct_b:+.1f}% needed, max ±{MAX_STRETCH_PCT:.1f}%)"

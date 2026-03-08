@@ -22,6 +22,15 @@ from pydantic import BaseModel
 from analyze_track import analyze_mp3, as_json_dict, from_json_dict
 from compatibility import compare_tracks
 from mashup_engine import MashupConfig, MashupEngine
+from user_model import (
+    extract_pairwise_features,
+    get_personalized_score,
+    load_user_model,
+    predict,
+    save_user_model,
+    update_weights,
+    blend_score,
+)
 
 logging.basicConfig(
     level=logging.INFO,
@@ -60,8 +69,8 @@ class PreviewRequest(BaseModel):
 
 
 class FeedbackRequest(BaseModel):
-    rating: int
-    comments: Optional[str] = None
+    rating: str  # "up" or "down"
+    user_id: str
 
 
 
@@ -121,7 +130,7 @@ async def upload_tracks(
 
 @app.post("/analyze/{session_id}")
 @app.post("/api/analyze/{session_id}")
-async def analyze_session(session_id: str) -> Dict[str, Any]:
+async def analyze_session(session_id: str, user_id: Optional[str] = None) -> Dict[str, Any]:
     sdir = require_session(session_id)
     meta = json.loads((sdir / "meta.json").read_text())
     path_a = meta["track_a"]
@@ -197,6 +206,13 @@ async def analyze_session(session_id: str) -> Dict[str, Any]:
             ],
         },
     }
+
+    # Add personalized score if user model exists.
+    if user_id:
+        best_base = max(comp_ab.compatibility_score, comp_ba.compatibility_score)
+        p_score = get_personalized_score(user_id, feats_a, feats_b, best_base)
+        if p_score is not None:
+            result["personalized_score"] = round(p_score, 1)
 
     # Persist per-track fast artifacts so preview can reuse them.
     (sdir / "track_a_analysis.json").write_text(json.dumps(as_json_dict(feats_a), indent=2))
@@ -309,6 +325,50 @@ async def download_audio(session_id: str):
     if wav.exists():
         return FileResponse(str(wav), media_type="audio/wav", filename="mashup_preview.wav")
     raise HTTPException(status_code=404, detail="Rendered audio not found.")
+
+
+@app.post("/feedback/{session_id}")
+@app.post("/api/feedback/{session_id}")
+async def submit_feedback(session_id: str, req: FeedbackRequest) -> Dict[str, Any]:
+    sdir = require_session(session_id)
+
+    if req.rating not in ("up", "down"):
+        raise HTTPException(status_code=400, detail="rating must be 'up' or 'down'")
+
+    # Load track features from saved analysis artifacts.
+    try:
+        feats_a = from_json_dict(json.loads((sdir / "track_a_analysis.json").read_text()))
+        feats_b = from_json_dict(json.loads((sdir / "track_b_analysis.json").read_text()))
+    except Exception:
+        raise HTTPException(status_code=400, detail="Analysis artifacts not found for this session. Run analyze first.")
+
+    features = extract_pairwise_features(feats_a, feats_b)
+    label = 1 if req.rating == "up" else 0
+
+    model = load_user_model(req.user_id)
+    model["weights"] = update_weights(model["weights"], features, label)
+    model["n_votes"] += 1
+    save_user_model(req.user_id, model)
+
+    # Compute updated blended score.
+    best_base = 0.0
+    try:
+        analysis = json.loads((sdir / "analysis.json").read_text())
+        best_base = max(
+            analysis.get("compatibility", {}).get("inst_a_vocals_b", {}).get("score", 0),
+            analysis.get("compatibility", {}).get("vocals_a_inst_b", {}).get("score", 0),
+        )
+    except Exception:
+        pass
+
+    model_score = predict(model["weights"], features)
+    updated_score = blend_score(best_base, model_score, model["n_votes"])
+
+    return {
+        "success": True,
+        "updated_score": round(updated_score, 1),
+        "n_votes": model["n_votes"],
+    }
 
 
 @app.delete("/session/{session_id}")
