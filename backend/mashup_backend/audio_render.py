@@ -96,12 +96,12 @@ def soft_limit(y: np.ndarray, drive: float = 1.1) -> np.ndarray:
 
 def high_pass_filter(y: np.ndarray, sr: int, cutoff: float = 140.0) -> np.ndarray:
     """Light cleanup for vocal stems; removes sub-bass bleed."""
-    from scipy.signal import butter, lfilter
+    from scipy.signal import butter, filtfilt
 
     nyq = 0.5 * sr
     normal_cutoff = min(0.99, cutoff / max(nyq, 1e-9))
     b, a = butter(2, normal_cutoff, btype="high", analog=False)
-    return lfilter(b, a, y).astype(np.float32)
+    return filtfilt(b, a, y).astype(np.float32)
 
 
 def overlay_audio(

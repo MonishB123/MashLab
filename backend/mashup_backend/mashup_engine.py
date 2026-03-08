@@ -353,7 +353,7 @@ def _eq_vocal(vocal: np.ndarray, sr: int) -> np.ndarray:
     - high-pass below 120 Hz
     - slight presence boost around 3-5 kHz
     """
-    from scipy.signal import butter, lfilter
+    from scipy.signal import butter, filtfilt
 
     y = high_pass_filter(vocal, sr, cutoff=120.0)
     nyq = 0.5 * sr
@@ -361,7 +361,7 @@ def _eq_vocal(vocal: np.ndarray, sr: int) -> np.ndarray:
     hi = min(0.99, 5000.0 / max(nyq, 1e-9))
     if lo < hi:
         b, a = butter(2, [lo, hi], btype="band")
-        band = lfilter(b, a, y).astype(np.float32)
+        band = filtfilt(b, a, y).astype(np.float32)
         y = (y + 0.12 * band).astype(np.float32)
     return y.astype(np.float32)
 
@@ -372,7 +372,7 @@ def _eq_instrumental(inst: np.ndarray, sr: int) -> np.ndarray:
     - slight cut 300-500 Hz
     - slight cut 2-4 kHz
     """
-    from scipy.signal import butter, lfilter
+    from scipy.signal import butter, filtfilt
 
     y = inst.astype(np.float32)
     nyq = 0.5 * sr
@@ -381,7 +381,7 @@ def _eq_instrumental(inst: np.ndarray, sr: int) -> np.ndarray:
         hi = min(0.99, hi_hz / max(nyq, 1e-9))
         if lo < hi:
             b, a = butter(2, [lo, hi], btype="band")
-            band = lfilter(b, a, y).astype(np.float32)
+            band = filtfilt(b, a, y).astype(np.float32)
             y = (y - amount * band).astype(np.float32)
     return y.astype(np.float32)
 
@@ -416,6 +416,11 @@ def _onset_offset_and_score(
     """
     Find a global offset (in samples) that maximizes beat/onset overlap.
     No time-stretching and no pitch shifting.
+
+    Uses onset cross-correlation to find a rough offset, then snaps to the
+    nearest beat-grid-aligned position using actual detected beat positions.
+    This prevents half-beat-off alignment where onset correlation is high
+    but beats land on the wrong phase.
     """
     hop = 512
     env_master = librosa.onset.onset_strength(y=master, sr=sr, hop_length=hop)
@@ -440,17 +445,49 @@ def _onset_offset_and_score(
     window = corr[lo:hi]
     best_lag = int(np.argmax(window)) + lo - center
 
-    # Also test likely downbeat disagreements: +/- half beat and +/- one beat.
+    # --- Beat-grid snap ---
+    # Detect beat positions in both signals and compute the phase offset
+    # needed to align the two beat grids.  Then generate candidate lags
+    # that are beat-grid-aligned (the onset-corr lag rounded to the nearest
+    # position where beat phases match).
+    _, beats_master = librosa.beat.beat_track(y=master, sr=sr, hop_length=hop, units="time")
+    _, beats_ref = librosa.beat.beat_track(y=reference, sr=sr, hop_length=hop, units="time")
+
     tempo_arr = librosa.feature.tempo(onset_envelope=env_master, sr=sr, hop_length=hop, aggregate=np.median)
     tempo_bpm = float(np.ravel(tempo_arr)[0]) if np.size(tempo_arr) else 120.0
-    beat_frames = max(1, int(round((60.0 / max(tempo_bpm, 1e-6)) * sr / hop)))
+    beat_period_s = 60.0 / max(tempo_bpm, 1e-6)
+    beat_frames = max(1, int(round(beat_period_s * sr / hop)))
+
+    # Compute beat-grid phase from each signal's detected beats.
+    if len(beats_master) >= 3 and len(beats_ref) >= 3:
+        phase_master = float(np.median(beats_master[:10] % beat_period_s))
+        phase_ref = float(np.median(beats_ref[:10] % beat_period_s))
+        phase_diff_s = phase_master - phase_ref  # offset to align ref to master
+
+        # Generate beat-grid-aligned lags near the onset-corr best lag.
+        # These are offsets where ref beats would land on master beats.
+        corr_offset_s = best_lag * hop / sr
+        n_beats_offset = round((corr_offset_s - phase_diff_s) / beat_period_s)
+        grid_candidates_s = [
+            n_beats_offset * beat_period_s + phase_diff_s,
+            (n_beats_offset + 1) * beat_period_s + phase_diff_s,
+            (n_beats_offset - 1) * beat_period_s + phase_diff_s,
+        ]
+        grid_candidate_frames = [
+            int(round(s * sr / hop)) for s in grid_candidates_s
+        ]
+    else:
+        grid_candidate_frames = []
+
+    # Build final candidate list: onset-corr best + beat-grid-snapped +
+    # traditional ±beat/half-beat offsets as fallback.
     candidate_lags = [
         best_lag,
         best_lag - beat_frames,
         best_lag + beat_frames,
         best_lag - (beat_frames // 2),
         best_lag + (beat_frames // 2),
-    ]
+    ] + grid_candidate_frames
 
     def _corr_at_lag(lag: int) -> float:
         idx = center + lag
@@ -458,7 +495,41 @@ def _onset_offset_and_score(
             return -1e9
         return float(corr[idx])
 
-    best_lag = max(candidate_lags, key=_corr_at_lag)
+    def _beat_alignment_score(lag: int) -> float:
+        """Score how well the beat grids align at this lag."""
+        if len(beats_master) < 3 or len(beats_ref) < 3:
+            return 0.0
+        offset_s = lag * hop / sr
+        # Compute the phase relationship directly: are shifted ref beats
+        # landing on the same phase as master beats?
+        master_phase = float(beats_master[0]) % beat_period_s
+        shifted_ref_beats = beats_ref + offset_s
+        half_beat = beat_period_s / 2.0
+        total_err = 0.0
+        count = 0
+        for rb in shifted_ref_beats:
+            if rb < 0:
+                continue
+            # How far is this beat from the master beat grid phase?
+            phase_err = (rb - master_phase) % beat_period_s
+            if phase_err > half_beat:
+                phase_err = beat_period_s - phase_err
+            total_err += phase_err / half_beat  # 0 = on grid, 1 = half beat off
+            count += 1
+        if count == 0:
+            return 0.0
+        return 1.0 - (total_err / count)  # 1.0 = perfect, 0.0 = half beat off
+
+    # Score candidates by weighted combination of correlation and beat alignment.
+    # Beat alignment gets 60% weight to prevent half-beat-off selection.
+    def _combined_score(lag: int) -> float:
+        c = _corr_at_lag(lag)
+        norm = (float(np.linalg.norm(env_master)) * float(np.linalg.norm(env_ref))) + 1e-9
+        corr_score = max(0.0, c / norm)
+        beat_score = _beat_alignment_score(lag)
+        return 0.40 * corr_score + 0.60 * beat_score
+
+    best_lag = max(candidate_lags, key=_combined_score)
     norm = (float(np.linalg.norm(env_master)) * float(np.linalg.norm(env_ref))) + 1e-9
     score = _corr_at_lag(best_lag) / norm
     offset_samples = int(best_lag * hop)
