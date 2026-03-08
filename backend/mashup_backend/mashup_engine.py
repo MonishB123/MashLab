@@ -558,12 +558,14 @@ def _render_with_stems(
 
     # Match vocal/instrumental loudness (equal dB proxy via RMS) before summing.
     mixed = _mix_equal_db(inst_eq, vocal_eq)
-    return mixed, beat_sync_score, instrumental, aligned_vocal
+    # Return rhythm_reference (original full track of vocal side) for sync
+    # analysis — separated vocal stems lack rhythmic onsets.
+    return mixed, beat_sync_score, instrumental, rhythm_reference
 
 
 def _trim_to_best_sync(
     instrumental: np.ndarray,
-    vocal: np.ndarray,
+    rhythm_ref: np.ndarray,
     mixed: np.ndarray,
     sr: int,
     min_duration: float = 20.0,
@@ -573,68 +575,81 @@ def _trim_to_best_sync(
     """
     Scan the rendered audio for the best-synced sub-region and trim to it.
 
-    Computes onset envelopes for the instrumental and aligned vocal, then
-    slides a window across and picks the contiguous region (>= min_duration)
-    with the highest local onset cross-correlation.  If no region scores
-    well, the full clip is returned unchanged.
+    Uses onset envelopes of the instrumental and rhythm reference (original
+    full track of the vocal side — NOT the separated vocal, which lacks
+    rhythmic onsets) to find where beats lock best.
+
+    Slides small (5s) analysis windows across the clip, scores each by onset
+    cross-correlation, then finds the best contiguous region >= min_duration.
     """
     total_s = len(mixed) / sr
     if total_s <= min_duration + 1.0:
-        return mixed  # Already short enough, nothing to trim
+        return mixed
 
     hop = 512
     env_inst = librosa.onset.onset_strength(y=instrumental, sr=sr, hop_length=hop).astype(np.float32)
-    env_voc = librosa.onset.onset_strength(y=vocal, sr=sr, hop_length=hop).astype(np.float32)
+    env_ref = librosa.onset.onset_strength(y=rhythm_ref, sr=sr, hop_length=hop).astype(np.float32)
 
-    min_len = max(len(env_inst), len(env_voc))
-    if min_len == 0:
+    n_frames = min(len(env_inst), len(env_ref))
+    if n_frames == 0:
         return mixed
 
-    # Window size in frames: use min_duration
-    win_frames = int(min_duration * sr / hop)
-    step_frames = max(1, int(1.0 * sr / hop))  # 1-second steps
+    # Use 5s analysis windows for fine-grained scoring, stepped every 1s
+    analysis_win_s = 5.0
+    win_frames = int(analysis_win_s * sr / hop)
+    step_frames = max(1, int(1.0 * sr / hop))
     max_lag = int(0.15 * sr / hop)  # 150ms tolerance
 
-    n_frames = min(len(env_inst), len(env_voc))
     if win_frames >= n_frames:
         return mixed
 
-    # Score each window position
-    scores = []
+    # Score each 5s position
     positions = list(range(0, n_frames - win_frames + 1, step_frames))
+    scores = []
     for pos in positions:
-        chunk_inst = env_inst[pos : pos + win_frames]
-        chunk_voc = env_voc[pos : pos + win_frames]
-        score = _window_onset_corr(chunk_inst, chunk_voc, max_lag)
-        scores.append(score)
+        sc = _window_onset_corr(
+            env_inst[pos : pos + win_frames],
+            env_ref[pos : pos + win_frames],
+            max_lag,
+        )
+        scores.append(sc)
 
     if not scores:
         return mixed
 
-    # Find the best contiguous region of high-sync windows.
-    # Start from the best single window and expand outward while score stays
-    # above 70 % of the peak.
-    best_idx = int(np.argmax(scores))
-    threshold = 0.70 * scores[best_idx]
+    scores_arr = np.array(scores, dtype=np.float32)
+    peak_score = float(np.max(scores_arr))
+    if peak_score < 1e-6:
+        return mixed  # No meaningful correlation anywhere
 
-    lo = best_idx
-    hi = best_idx
-    while lo > 0 and scores[lo - 1] >= threshold:
-        lo -= 1
-    while hi < len(scores) - 1 and scores[hi + 1] >= threshold:
-        hi += 1
+    # Slide a min_duration-sized window over the per-second scores and
+    # pick the position with the highest average sync score.
+    min_windows = max(1, int(min_duration))  # ~1 window per second
+    if len(scores_arr) <= min_windows:
+        return mixed
 
-    # Convert frame indices back to sample positions
-    start_sample = positions[lo] * hop
-    end_sample = min(len(mixed), (positions[hi] + win_frames) * hop)
+    # Compute rolling average efficiently
+    cumsum = np.cumsum(np.insert(scores_arr, 0, 0.0))
+    rolling_avg = (cumsum[min_windows:] - cumsum[:-min_windows]) / min_windows
+    best_run_start = int(np.argmax(rolling_avg))
+    best_run_avg = float(rolling_avg[best_run_start])
+    full_avg = float(np.mean(scores_arr))
 
-    # Ensure minimum duration
+    # Only trim if the best region is meaningfully better than the full clip
+    if best_run_avg <= full_avg * 1.05:
+        return mixed  # Best region isn't much better, keep full clip
+
+    # Convert back to samples
+    start_sample = positions[best_run_start] * hop
+    end_pos_idx = min(best_run_start + min_windows - 1, len(positions) - 1)
+    end_sample = min(len(mixed), (positions[end_pos_idx] + win_frames) * hop)
+
     region_duration = (end_sample - start_sample) / sr
     if region_duration < min_duration:
-        return mixed  # Can't find a good region, keep full clip
+        return mixed
 
-    # If the trimmed region is nearly the full clip (>90%), skip trimming
-    if region_duration >= total_s * 0.90:
+    # If trimmed region is nearly the full clip (>85%), skip trimming
+    if region_duration >= total_s * 0.85:
         return mixed
 
     trimmed = mixed[start_sample:end_sample].copy()
