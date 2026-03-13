@@ -1,5 +1,13 @@
 # MashLab
 
+MashLab is an automated, AI-driven audio mashup engine designed to seamlessly blend tracks using advanced Music Information Retrieval (MIR) techniques.
+
+Audio Infrastructure: Utilizes PyTorch (Demucs) for 4-stem source separation and dynamic programming for onset cross-correlation and beat-grid snapping.
+
+Compatibility Engine: Evaluates track pairings based on key (Krumhansl-Schmuckler), tempo, and spectral frequency separation.
+
+Personalization: Implements an online logistic regression model that learns user preferences via SGD across 11 engineered audio features.
+
 Repo layout:
 
 - `frontend/`: React + Vite UI
